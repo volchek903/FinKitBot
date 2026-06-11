@@ -1,9 +1,9 @@
 import asyncio
 import logging
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from app.config import get_settings
 from app.models import Offer
+from app.offers_url import build_offers_url
 
 logger = logging.getLogger(__name__)
 
@@ -74,39 +74,4 @@ def _fmt(value: object) -> str:
 def _offer_link(offer: Offer, threshold: float, default_url: str) -> str:
     if offer.url:
         return offer.url
-    return _with_threshold(default_url, threshold)
-
-
-def _with_threshold(url: str, threshold: float) -> str:
-    parts = urlsplit(url)
-    query = parse_qsl(parts.query, keep_blank_values=True)
-    threshold_value = _query_value(threshold)
-    updated_query: list[tuple[str, str]] = []
-    replaced = False
-
-    for key, value in query:
-        if key == "borrower_score_min":
-            if not replaced:
-                updated_query.append((key, threshold_value))
-                replaced = True
-            continue
-        updated_query.append((key, value))
-
-    if not replaced:
-        updated_query.append(("borrower_score_min", threshold_value))
-
-    return urlunsplit(
-        (
-            parts.scheme,
-            parts.netloc,
-            parts.path,
-            urlencode(updated_query),
-            parts.fragment,
-        )
-    )
-
-
-def _query_value(value: float) -> str:
-    if float(value).is_integer():
-        return str(int(value))
-    return str(value)
+    return build_offers_url(default_url, threshold)

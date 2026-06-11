@@ -10,6 +10,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 from app.config import get_settings
 from app.models import Offer
+from app.offers_url import current_offers_url
 from app.parser import ROW_SELECTOR, parse_offers_from_html, parse_offers_from_json
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ async def get_offers_from_api_or_dom() -> list[Offer]:
     from playwright.async_api import async_playwright
 
     settings = get_settings()
+    target_url = current_offers_url()
     settings.playwright_state_file.parent.mkdir(parents=True, exist_ok=True)
     context_options: dict[str, Any] = {}
     if settings.playwright_state_file.exists():
@@ -65,7 +67,7 @@ async def get_offers_from_api_or_dom() -> list[Offer]:
                 offers = await _offers_from_capture(context, capture)
                 if not offers:
                     continue
-                priority = _capture_priority(capture, settings.finkit_offers_url)
+                priority = _capture_priority(capture, target_url)
                 if best_api_priority is None or (priority, len(offers)) > (best_api_priority, len(best_api_offers)):
                     best_api_priority = priority
                     best_api_offers = offers
@@ -146,7 +148,6 @@ def payload_looks_like_offers(payload: Any) -> bool:
 
 
 async def _login_if_needed(page: Any, context: Any) -> None:
-    settings = get_settings()
     if not await _login_appears_required(page):
         await _save_storage_state(context)
         return
@@ -172,6 +173,7 @@ async def _login_if_needed(page: Any, context: Any) -> None:
             return
         raise RuntimeError("Требуется авторизация, но поля логина/пароля не найдены")
 
+    settings = get_settings()
     if not settings.finkit_login or not settings.finkit_password:
         raise RuntimeError("Требуется авторизация FinKit, но FINKIT_LOGIN/FINKIT_PASSWORD не заполнены")
 
@@ -196,7 +198,8 @@ async def _login_if_needed(page: Any, context: Any) -> None:
         raise RuntimeError("Не удалось авторизоваться в FinKit: проверьте логин и пароль")
 
     await _raise_if_blocked_auth(page)
-    if await _auth_session_is_authenticated(context) and page.url != settings.finkit_offers_url:
+    target_url = current_offers_url()
+    if await _auth_session_is_authenticated(context) and page.url != target_url:
         await _open_offers_page(page)
 
     if await _login_appears_required(page) and not await _page_has_offers_table(page):
@@ -629,8 +632,7 @@ async def _auth_session_is_authenticated(context: Any) -> bool:
 
 
 async def _open_offers_page(page: Any) -> None:
-    settings = get_settings()
-    await page.goto(settings.finkit_offers_url, wait_until="commit", timeout=NAVIGATION_TIMEOUT_MS)
+    await page.goto(current_offers_url(), wait_until="commit", timeout=NAVIGATION_TIMEOUT_MS)
     await _settle_after_navigation(page)
 
 

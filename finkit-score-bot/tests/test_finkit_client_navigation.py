@@ -1,6 +1,7 @@
 import asyncio
 from typing import Any
 
+from app import storage
 from app.finkit_client import (
     NAVIGATION_TIMEOUT_MS,
     NETWORK_IDLE_TIMEOUT_MS,
@@ -45,16 +46,24 @@ class FakePage:
             del self.listeners[event]
 
 
-def test_open_offers_page_uses_commit_navigation() -> None:
+def test_open_offers_page_uses_commit_navigation(monkeypatch, tmp_path) -> None:
+    get_settings.cache_clear()
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "bot.sqlite3"))
+    monkeypatch.setenv("FINKIT_OFFERS_URL", "https://finkit.by/app/invest-manually")
+    monkeypatch.setenv("DEFAULT_SCORE_THRESHOLD", "65")
+    storage.init_db()
     get_settings.cache_clear()
     settings = get_settings()
     page = FakePage()
 
-    asyncio.run(_open_offers_page(page))
+    try:
+        asyncio.run(_open_offers_page(page))
+    finally:
+        get_settings.cache_clear()
 
     assert page.goto_calls == [
         {
-            "url": settings.finkit_offers_url,
+            "url": f"{settings.finkit_offers_url}?borrower_score_min=65",
             "wait_until": "commit",
             "timeout": NAVIGATION_TIMEOUT_MS,
         }
@@ -65,13 +74,49 @@ def test_open_offers_page_uses_commit_navigation() -> None:
     assert page.wait_for_timeout_calls == [POST_NAVIGATION_DELAY_MS]
 
 
-def test_open_offers_page_tolerates_network_idle_timeout() -> None:
+def test_open_offers_page_tolerates_network_idle_timeout(monkeypatch, tmp_path) -> None:
+    get_settings.cache_clear()
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "bot.sqlite3"))
+    monkeypatch.setenv("FINKIT_OFFERS_URL", "https://finkit.by/app/invest-manually")
+    monkeypatch.setenv("DEFAULT_SCORE_THRESHOLD", "65")
+    storage.init_db()
+    get_settings.cache_clear()
     page = FakePage(fail_network_idle=True)
 
-    asyncio.run(_open_offers_page(page))
+    try:
+        asyncio.run(_open_offers_page(page))
+    finally:
+        get_settings.cache_clear()
 
     assert page.goto_calls
     assert page.wait_for_timeout_calls == [POST_NAVIGATION_DELAY_MS]
+
+
+def test_open_offers_page_uses_saved_threshold(monkeypatch, tmp_path) -> None:
+    get_settings.cache_clear()
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "bot.sqlite3"))
+    monkeypatch.setenv(
+        "FINKIT_OFFERS_URL",
+        "https://finkit.by/app/invest-manually?borrower_score_min=30&ordering=-signed_at",
+    )
+    monkeypatch.setenv("DEFAULT_SCORE_THRESHOLD", "65")
+    storage.init_db()
+    storage.set_threshold(44)
+    get_settings.cache_clear()
+    page = FakePage()
+
+    try:
+        asyncio.run(_open_offers_page(page))
+    finally:
+        get_settings.cache_clear()
+
+    assert page.goto_calls == [
+        {
+            "url": "https://finkit.by/app/invest-manually?borrower_score_min=44&ordering=-signed_at",
+            "wait_until": "commit",
+            "timeout": NAVIGATION_TIMEOUT_MS,
+        }
+    ]
 
 
 def test_discover_offers_api_reloads_with_commit_navigation() -> None:
