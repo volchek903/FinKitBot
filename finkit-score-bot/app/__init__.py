@@ -1,0 +1,2 @@
+"""FinKit score monitor bot."""
+

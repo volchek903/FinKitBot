@@ -1,0 +1,10 @@
+services:
+  finkit-score-bot:
+    build: .
+    container_name: finkit-score-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+
