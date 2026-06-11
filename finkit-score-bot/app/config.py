@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     telegram_allowed_user_ids: tuple[int, ...] = Field(default_factory=tuple)
 
     default_score_threshold: float = 65
-    score_compare_mode: str = "gt"
+    score_compare_mode: str = "gte"
     check_interval_seconds: int = 30
 
     database_path: str = "data/bot.sqlite3"
@@ -77,4 +77,3 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-

@@ -1,3 +1,4 @@
+from app.config import get_settings
 from app.models import Offer
 from app.monitor import is_available, score_matches
 
@@ -13,6 +14,17 @@ def test_threshold_gte_mode() -> None:
     assert score_matches(64.9, 65, "gte") is False
 
 
+def test_threshold_default_mode_is_gte(monkeypatch) -> None:
+    monkeypatch.delenv("SCORE_COMPARE_MODE", raising=False)
+    get_settings.cache_clear()
+
+    try:
+        assert score_matches(50, 50) is True
+        assert score_matches(49.9, 50) is False
+    finally:
+        get_settings.cache_clear()
+
+
 def test_is_available() -> None:
     assert is_available(Offer(id="1", score=70, status=None)) is True
     assert is_available(Offer(id="2", score=70, status="unknown")) is True
@@ -20,4 +32,3 @@ def test_is_available() -> None:
     assert is_available(Offer(id="4", score=70, status="available")) is True
     assert is_available(Offer(id="5", score=70, status="closed")) is False
     assert is_available(Offer(id="6", score=70, status="недоступно")) is False
-

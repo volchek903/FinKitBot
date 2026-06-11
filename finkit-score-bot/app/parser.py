@@ -1,6 +1,7 @@
 import hashlib
 import json
 import re
+from datetime import datetime
 from typing import Any, Iterable
 from urllib.parse import urljoin
 
@@ -45,10 +46,10 @@ FIELD_ALIASES = {
     "term": ("term",),
     "rate": ("interest_rate", "rate"),
     "rating": ("borrower_rating", "rating"),
-    "borrower": ("borrower",),
+    "borrower": ("borrower", "borrower_short_name"),
     "signed_at": ("signed_at", "signedAt", "signedAtDate"),
     "expected_income": ("expected_income", "expectedIncome"),
-    "status": ("status",),
+    "status": ("status_display", "status"),
     "url": ("url", "link", "href"),
     "invest": ("invest",),
 }
@@ -195,17 +196,19 @@ def parse_offers_from_html(html: str, base_url: str) -> list[Offer]:
 
 def _offer_from_dict(item: dict[str, Any]) -> Offer:
     score = parse_score(_get_alias_value(item, SCORE_ALIASES))
-    amount = _value_to_str(_get_alias_value(item, FIELD_ALIASES["amount"]))
+    amount = _format_amount(_get_alias_value(item, FIELD_ALIASES["amount"]))
     term = _value_to_str(_get_alias_value(item, FIELD_ALIASES["term"]))
-    rate = _value_to_str(_get_alias_value(item, FIELD_ALIASES["rate"]))
+    rate = _format_rate(_get_alias_value(item, FIELD_ALIASES["rate"]))
     rating = _value_to_str(_get_alias_value(item, FIELD_ALIASES["rating"]))
     borrower = clean_borrower(_value_to_str(_get_alias_value(item, FIELD_ALIASES["borrower"])))
-    signed_at = _value_to_str(_get_alias_value(item, FIELD_ALIASES["signed_at"]))
+    signed_at = _format_signed_at(_get_alias_value(item, FIELD_ALIASES["signed_at"]))
     expected_income = _value_to_str(_get_alias_value(item, FIELD_ALIASES["expected_income"]))
     status = _value_to_str(_get_alias_value(item, FIELD_ALIASES["status"]))
     invest = _get_alias_value(item, FIELD_ALIASES["invest"])
     if status is None and invest is not None:
         status = _status_from_invest(invest)
+    if expected_income is None:
+        expected_income = _estimate_expected_income(amount, rate, term)
     url = _value_to_str(_get_alias_value(item, FIELD_ALIASES["url"]))
     offer_id = _value_to_str(_get_alias_value(item, ID_ALIASES))
     if not offer_id:
@@ -308,3 +311,43 @@ def _status_from_invest(value: Any) -> str | None:
         return None
     return text
 
+
+def _format_amount(value: Any) -> str | None:
+    text = _value_to_str(value)
+    if text is None or any(marker in text.upper() for marker in ("BYN", "USD", "EUR", "RUB")):
+        return text
+    amount = parse_score(text)
+    if amount is None:
+        return text
+    return f"{amount:.2f} BYN"
+
+
+def _format_rate(value: Any) -> str | None:
+    text = _value_to_str(value)
+    if text is None or "%" in text:
+        return text
+    rate = parse_score(text)
+    if rate is None:
+        return text
+    return f"{rate:.2f} %"
+
+
+def _format_signed_at(value: Any) -> str | None:
+    text = _value_to_str(value)
+    if text is None:
+        return None
+    if "T" not in text:
+        return text
+    try:
+        return datetime.fromisoformat(text).strftime("%d.%m.%Y")
+    except ValueError:
+        return text
+
+
+def _estimate_expected_income(amount: str | None, rate: str | None, term: str | None) -> str | None:
+    amount_value = parse_score(amount)
+    rate_value = parse_score(rate)
+    term_value = parse_score(term)
+    if amount_value is None or rate_value is None or term_value is None:
+        return None
+    return f"{(amount_value * rate_value * term_value / 100):.2f} BYN"

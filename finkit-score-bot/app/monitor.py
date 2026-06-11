@@ -7,7 +7,10 @@ from app.models import Offer
 logger = logging.getLogger(__name__)
 
 
-async def check_once(include_seen_unnotified: bool = False) -> tuple[int, int]:
+async def check_once(
+    include_seen_unnotified: bool = False,
+    include_seen_notified: bool = False,
+) -> tuple[int, int]:
     settings = get_settings()
     threshold = storage.get_threshold(settings.default_score_threshold)
     offers_count = 0
@@ -23,7 +26,9 @@ async def check_once(include_seen_unnotified: bool = False) -> tuple[int, int]:
         for offer in offers:
             seen = storage.get_seen(offer.id)
             if seen is not None:
-                if not include_seen_unnotified or seen.get("notified_at"):
+                if not include_seen_notified and (
+                    not include_seen_unnotified or seen.get("notified_at")
+                ):
                     continue
             else:
                 storage.save_seen(offer)
@@ -39,7 +44,7 @@ async def check_once(include_seen_unnotified: bool = False) -> tuple[int, int]:
             offers_count,
             notified_count,
             threshold,
-            include_seen_unnotified,
+            include_seen_unnotified or include_seen_notified,
         )
         return offers_count, notified_count
     except Exception as exc:
@@ -49,7 +54,7 @@ async def check_once(include_seen_unnotified: bool = False) -> tuple[int, int]:
 
 
 async def check_after_threshold_change() -> tuple[int, int]:
-    return await check_once(include_seen_unnotified=True)
+    return await check_once(include_seen_unnotified=True, include_seen_notified=True)
 
 
 def score_matches(score: float | None, threshold: float, compare_mode: str | None = None) -> bool:

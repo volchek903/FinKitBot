@@ -47,7 +47,7 @@ def create_dispatcher() -> Any:
         threshold = storage.get_threshold(settings.default_score_threshold)
         await message.answer(
             "Бот мониторит FinKit и уведомляет о новых предложениях "
-            "со скор баллом выше порога.\n\n"
+            "со скор баллом не ниже порога.\n\n"
             f"Текущий порог: {_format_number(threshold)}\n"
             f"Интервал проверки: {settings.check_interval_seconds} сек."
         )

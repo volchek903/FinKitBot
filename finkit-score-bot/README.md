@@ -1,6 +1,6 @@
 # FinKit Score Bot
 
-Telegram-бот мониторит страницу FinKit `https://finkit.by/app/invest-manually` и отправляет уведомление, когда появляется новое доступное предложение со скор баллом выше заданного порога. Бот только читает данные и отправляет уведомления: он не инвестирует автоматически, не отправляет заявки, не меняет данные на сайте и не обходит капчу, 2FA или другие защитные механизмы.
+Telegram-бот мониторит страницу FinKit `https://finkit.by/app/invest-manually` и отправляет уведомление, когда появляется новое доступное предложение со скор баллом не ниже заданного порога. Бот только читает данные и отправляет уведомления: он не инвестирует автоматически, не отправляет заявки, не меняет данные на сайте и не обходит капчу, 2FA или другие защитные механизмы.
 
 ## Как создать Telegram-бота
 
@@ -51,10 +51,10 @@ TELEGRAM_CHAT_ID=123456789
 
 ```text
 DEFAULT_SCORE_THRESHOLD=65
-SCORE_COMPARE_MODE=gt
+SCORE_COMPARE_MODE=gte
 ```
 
-`SCORE_COMPARE_MODE=gt` означает `score > threshold`, `SCORE_COMPARE_MODE=gte` означает `score >= threshold`.
+`SCORE_COMPARE_MODE=gte` означает `score >= threshold`, `SCORE_COMPARE_MODE=gt` означает `score > threshold`. По умолчанию используется `gte`.
 
 `TELEGRAM_ALLOWED_USER_IDS` можно заполнить списком Telegram user ID через запятую. Если список пустой, команды разрешены пользователю или чату из `TELEGRAM_CHAT_ID`.
 

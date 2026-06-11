@@ -10,7 +10,10 @@ COPY requirements.txt .
 COPY vendor/wheels /tmp/wheels
 RUN --mount=type=cache,target=/root/.cache/pip \
     for attempt in 1 2 3 4 5; do \
-        python -m pip install --retries 20 --timeout 120 /tmp/wheels/playwright-1.60.0-py3-none-manylinux1_x86_64.whl && \
+        case "$(uname -m)" in \
+            x86_64|amd64) python -m pip install --retries 20 --timeout 120 /tmp/wheels/playwright-1.60.0-py3-none-manylinux1_x86_64.whl ;; \
+            *) echo "Skipping vendored x86_64 Playwright wheel on $(uname -m)" ;; \
+        esac && \
         python -m pip install --retries 20 --timeout 120 -r requirements.txt && exit 0; \
         echo "pip install failed, retrying in 10 seconds..."; \
         sleep 10; \

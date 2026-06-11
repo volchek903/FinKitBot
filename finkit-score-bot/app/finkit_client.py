@@ -30,6 +30,11 @@ PER_PAGE_KEYS = ("per_page", "perPage", "page_size", "pageSize", "limit")
 OFFSET_KEYS = ("offset", "skip")
 TOTAL_KEYS = ("total", "total_count", "totalCount", "recordsTotal", "count")
 LAST_PAGE_KEYS = ("last_page", "lastPage", "pages", "page_count", "pageCount")
+NAVIGATION_TIMEOUT_MS = 60_000
+NETWORK_IDLE_TIMEOUT_MS = 15_000
+POST_NAVIGATION_DELAY_MS = 1_500
+AUTH_COMPLETION_TIMEOUT_MS = 15_000
+AUTH_POLL_INTERVAL_MS = 500
 
 
 async def get_offers() -> list[Offer]:
@@ -50,14 +55,19 @@ async def get_offers_from_api_or_dom() -> list[Offer]:
         context = await browser.new_context(**context_options)
         page = await context.new_page()
         try:
-            await page.goto(settings.finkit_offers_url, wait_until="domcontentloaded", timeout=60_000)
+            await _open_offers_page(page)
             await _login_if_needed(page, context)
 
             captures = await discover_offers_api(page)
             best_api_offers: list[Offer] = []
+            best_api_priority: tuple[int, int, int, int, int] | None = None
             for capture in captures:
                 offers = await _offers_from_capture(context, capture)
-                if len(offers) > len(best_api_offers):
+                if not offers:
+                    continue
+                priority = _capture_priority(capture, settings.finkit_offers_url)
+                if best_api_priority is None or (priority, len(offers)) > (best_api_priority, len(best_api_offers)):
+                    best_api_priority = priority
                     best_api_offers = offers
 
             if best_api_offers:
@@ -109,11 +119,9 @@ async def discover_offers_api(page: Any) -> list[dict[str, Any]]:
     page.on("response", on_response)
     try:
         if page.url == "about:blank":
-            await page.goto(settings.finkit_offers_url, wait_until="domcontentloaded", timeout=60_000)
+            await _open_offers_page(page)
         else:
-            await page.reload(wait_until="domcontentloaded", timeout=60_000)
-        await _wait_network_idle(page)
-        await page.wait_for_timeout(1500)
+            await _reload_offers_page(page)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
     finally:
@@ -183,8 +191,13 @@ async def _login_if_needed(page: Any, context: Any) -> None:
 
     await button.click()
     await _wait_network_idle(page)
-    await page.wait_for_timeout(1000)
+    if not await _wait_for_login_completion(page, context):
+        await _raise_if_blocked_auth(page)
+        raise RuntimeError("Не удалось авторизоваться в FinKit: проверьте логин и пароль")
+
     await _raise_if_blocked_auth(page)
+    if await _auth_session_is_authenticated(context) and page.url != settings.finkit_offers_url:
+        await _open_offers_page(page)
 
     if await _login_appears_required(page) and not await _page_has_offers_table(page):
         raise RuntimeError("Не удалось авторизоваться в FinKit: проверьте логин и пароль")
@@ -578,9 +591,63 @@ async def _body_text(page: Any) -> str:
         return ""
 
 
+async def _wait_for_login_completion(page: Any, context: Any) -> bool:
+    deadline = asyncio.get_running_loop().time() + (AUTH_COMPLETION_TIMEOUT_MS / 1000)
+    while asyncio.get_running_loop().time() < deadline:
+        if await _auth_session_is_authenticated(context):
+            return True
+        if not await _login_appears_required(page):
+            return True
+        await page.wait_for_timeout(AUTH_POLL_INTERVAL_MS)
+    return await _auth_session_is_authenticated(context) or not await _login_appears_required(page)
+
+
+async def _auth_session_is_authenticated(context: Any) -> bool:
+    settings = get_settings()
+    try:
+        response = await context.request.fetch(
+            f"{settings.finkit_api_base_url}/_allauth/browser/v1/auth/session",
+            method="GET",
+            timeout=10_000,
+        )
+        if not response.ok:
+            return False
+        payload = await response.json()
+    except Exception as exc:
+        logger.debug("failed to verify auth session: %s", exc)
+        return False
+
+    if not isinstance(payload, dict):
+        return False
+
+    meta = payload.get("meta")
+    if isinstance(meta, dict) and meta.get("is_authenticated") is True:
+        return True
+
+    data = payload.get("data")
+    return isinstance(data, dict) and data.get("user") is not None
+
+
+async def _open_offers_page(page: Any) -> None:
+    settings = get_settings()
+    await page.goto(settings.finkit_offers_url, wait_until="commit", timeout=NAVIGATION_TIMEOUT_MS)
+    await _settle_after_navigation(page)
+
+
+async def _reload_offers_page(page: Any) -> None:
+    await page.reload(wait_until="commit", timeout=NAVIGATION_TIMEOUT_MS)
+    await _settle_after_navigation(page)
+
+
+async def _settle_after_navigation(page: Any) -> None:
+    # FinKit sometimes finishes rendering useful content without ever reaching DOMContentLoaded.
+    await _wait_network_idle(page)
+    await page.wait_for_timeout(POST_NAVIGATION_DELAY_MS)
+
+
 async def _wait_network_idle(page: Any) -> None:
     try:
-        await page.wait_for_load_state("networkidle", timeout=15_000)
+        await page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT_MS)
     except Exception:
         pass
 
@@ -640,3 +707,24 @@ def _int_or_none(value: Any) -> int | None:
 
 def _request_key(method: str, url: str, post_data: str | None) -> str:
     return f"{method.upper()} {url} {post_data or ''}"
+
+
+def _capture_priority(capture: dict[str, Any], target_url: str) -> tuple[int, int, int, int, int]:
+    capture_url = str(capture.get("url") or "")
+    parsed_capture = urlparse(capture_url)
+    parsed_target = urlparse(target_url)
+    payload = capture.get("payload")
+
+    capture_query = dict(parse_qsl(parsed_capture.query, keep_blank_values=True))
+    target_query = dict(parse_qsl(parsed_target.query, keep_blank_values=True))
+
+    preferred_endpoint = 1 if "loans-to-invest" in parsed_capture.path else 0
+    matched_filters = sum(1 for key, value in target_query.items() if capture_query.get(key) == value)
+    missing_filters = sum(1 for key, value in target_query.items() if capture_query.get(key) != value)
+    capture_filters = 0
+    if target_query:
+        capture_filters = sum(
+            1 for key in capture_query if key not in {"page", "ordering", "page_size", "per_page", "limit"}
+        )
+    has_results = 1 if isinstance(payload, dict) and "results" in payload else 0
+    return preferred_endpoint, matched_filters, -missing_filters, capture_filters, has_results

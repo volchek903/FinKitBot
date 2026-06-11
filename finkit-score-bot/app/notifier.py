@@ -1,4 +1,6 @@
+import asyncio
 import logging
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from app.config import get_settings
 from app.models import Offer
@@ -22,7 +24,7 @@ async def notify_offer(offer: Offer, threshold: float) -> None:
         f"Ожидаемый доход: {_fmt(offer.expected_income)}\n"
         f"Статус: {_fmt(offer.status)}\n\n"
         "Ссылка:\n"
-        f"{offer.url or settings.finkit_offers_url}"
+        f"{_offer_link(offer, threshold, settings.finkit_offers_url)}"
     )
     await _send_text(text)
 
@@ -46,10 +48,17 @@ async def _send_text(text: str, fail_silently: bool = False) -> None:
         raise RuntimeError(message)
 
     from aiogram import Bot as TelegramBot
+    from aiogram.exceptions import TelegramRetryAfter
 
     bot = TelegramBot(token=settings.telegram_bot_token)
     try:
-        await bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
+        while True:
+            try:
+                await bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
+                return
+            except TelegramRetryAfter as exc:
+                logger.warning("telegram flood control hit retry_after=%s", exc.retry_after)
+                await asyncio.sleep(exc.retry_after)
     finally:
         await bot.session.close()
 
@@ -61,3 +70,43 @@ def _fmt(value: object) -> str:
         return str(int(value))
     return str(value)
 
+
+def _offer_link(offer: Offer, threshold: float, default_url: str) -> str:
+    if offer.url:
+        return offer.url
+    return _with_threshold(default_url, threshold)
+
+
+def _with_threshold(url: str, threshold: float) -> str:
+    parts = urlsplit(url)
+    query = parse_qsl(parts.query, keep_blank_values=True)
+    threshold_value = _query_value(threshold)
+    updated_query: list[tuple[str, str]] = []
+    replaced = False
+
+    for key, value in query:
+        if key == "borrower_score_min":
+            if not replaced:
+                updated_query.append((key, threshold_value))
+                replaced = True
+            continue
+        updated_query.append((key, value))
+
+    if not replaced:
+        updated_query.append(("borrower_score_min", threshold_value))
+
+    return urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc,
+            parts.path,
+            urlencode(updated_query),
+            parts.fragment,
+        )
+    )
+
+
+def _query_value(value: float) -> str:
+    if float(value).is_integer():
+        return str(int(value))
+    return str(value)

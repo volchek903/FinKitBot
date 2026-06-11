@@ -29,14 +29,13 @@ def test_parse_offers_from_json() -> None:
                 {
                     "offerId": 123,
                     "borrower_score": "66,7",
-                    "amount": "1200.00 BYN",
+                    "amount": "1200.00000",
                     "term": 60,
-                    "interest_rate": "0.80 %",
+                    "interest_rate": "0.80000",
                     "borrower_rating": "C",
-                    "borrower": "ДМИТРИЙ Д. i Профиль Просмотрено",
-                    "signed_at": "11.06.2026",
-                    "expected_income": "576.00 BYN",
-                    "invest": True,
+                    "borrower_short_name": "ДМИТРИЙ Д.",
+                    "signed_at": "2026-06-11T10:20:30+03:00",
+                    "status_display": "Опубликован",
                 }
             ]
         },
@@ -53,7 +52,9 @@ def test_parse_offers_from_json() -> None:
     assert offers[0].rate == "0.80 %"
     assert offers[0].rating == "C"
     assert offers[0].borrower == "ДМИТРИЙ Д."
-    assert offers[0].status == "available"
+    assert offers[0].signed_at == "11.06.2026"
+    assert offers[0].expected_income == "576.00 BYN"
+    assert offers[0].status == "Опубликован"
 
 
 def test_parse_offer_row() -> None:
@@ -135,4 +136,3 @@ def test_stable_offer_id_generation() -> None:
 
     assert first == second
     assert len(first) == 64
-
