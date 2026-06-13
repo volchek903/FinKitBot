@@ -40,6 +40,7 @@ def init_db() -> None:
                 chat_id INTEGER NOT NULL,
                 username TEXT,
                 first_name TEXT,
+                score_threshold REAL,
                 started_at TEXT,
                 expires_at TEXT,
                 trial_ended_notified_at TEXT
@@ -53,6 +54,7 @@ def init_db() -> None:
             );
             """
         )
+        _ensure_column(conn, "subscribers", "score_threshold", "REAL")
 
 
 def is_seen(offer_id: str) -> bool:
@@ -101,7 +103,15 @@ def get_subscriber(user_id: int) -> dict[str, Any] | None:
     with _connect() as conn:
         row = conn.execute(
             """
-            SELECT user_id, chat_id, username, first_name, started_at, expires_at, trial_ended_notified_at
+            SELECT
+                user_id,
+                chat_id,
+                username,
+                first_name,
+                score_threshold,
+                started_at,
+                expires_at,
+                trial_ended_notified_at
             FROM subscribers
             WHERE user_id = ?
             LIMIT 1
@@ -156,7 +166,15 @@ def get_active_subscribers() -> list[dict[str, Any]]:
     with _connect() as conn:
         rows = conn.execute(
             """
-            SELECT user_id, chat_id, username, first_name, started_at, expires_at, trial_ended_notified_at
+            SELECT
+                user_id,
+                chat_id,
+                username,
+                first_name,
+                score_threshold,
+                started_at,
+                expires_at,
+                trial_ended_notified_at
             FROM subscribers
             WHERE started_at IS NOT NULL
               AND expires_at IS NOT NULL
@@ -174,7 +192,15 @@ def get_expired_subscribers_pending_notice() -> list[dict[str, Any]]:
     with _connect() as conn:
         rows = conn.execute(
             """
-            SELECT user_id, chat_id, username, first_name, started_at, expires_at, trial_ended_notified_at
+            SELECT
+                user_id,
+                chat_id,
+                username,
+                first_name,
+                score_threshold,
+                started_at,
+                expires_at,
+                trial_ended_notified_at
             FROM subscribers
             WHERE started_at IS NOT NULL
               AND expires_at IS NOT NULL
@@ -239,6 +265,39 @@ def get_threshold(default: float) -> float:
         return float(row["value"])
     except (TypeError, ValueError):
         return default
+
+
+def get_user_threshold(user_id: int, default: float) -> float:
+    subscriber = get_subscriber(user_id)
+    if not subscriber:
+        return default
+    value = subscriber.get("score_threshold")
+    try:
+        return float(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def set_user_threshold(
+    user_id: int,
+    chat_id: int,
+    value: float,
+    username: str | None = None,
+    first_name: str | None = None,
+) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO subscribers (user_id, chat_id, username, first_name, score_threshold)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                chat_id = excluded.chat_id,
+                username = excluded.username,
+                first_name = excluded.first_name,
+                score_threshold = excluded.score_threshold
+            """,
+            (user_id, chat_id, username, first_name, value),
+        )
 
 
 def set_threshold(value: float) -> None:
@@ -363,3 +422,15 @@ def _upsert_subscriber_identity(
             """,
             (user_id, chat_id, username, first_name),
         )
+
+
+def _ensure_column(
+    conn: sqlite3.Connection,
+    table_name: str,
+    column_name: str,
+    column_definition: str,
+) -> None:
+    columns = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    if any(column["name"] == column_name for column in columns):
+        return
+    conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}")

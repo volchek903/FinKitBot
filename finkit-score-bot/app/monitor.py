@@ -14,7 +14,6 @@ async def check_once(
     include_seen_notified: bool = False,
 ) -> tuple[int, int]:
     settings = get_settings()
-    threshold = storage.get_threshold(settings.default_score_threshold)
     offers_count = 0
     notified_count = 0
 
@@ -36,6 +35,13 @@ async def check_once(
             storage.save_check_log("ok", offers_count, notified_count)
             logger.info("check skipped because there are no active subscribers")
             return offers_count, notified_count
+        subscriber_thresholds = {
+            int(subscriber["user_id"]): _resolve_threshold(
+                subscriber.get("score_threshold"),
+                settings.default_score_threshold,
+            )
+            for subscriber in active_subscribers
+        }
 
         offers = await get_offers()
         offers_count = len(offers)
@@ -45,12 +51,15 @@ async def check_once(
             if seen is None:
                 storage.save_seen(offer)
 
-            if not score_matches(offer.score, threshold) or not is_available(offer):
+            if not is_available(offer):
                 continue
 
             sent_for_offer = False
             for subscriber in active_subscribers:
                 user_id = int(subscriber["user_id"])
+                threshold = subscriber_thresholds[user_id]
+                if not score_matches(offer.score, threshold):
+                    continue
                 should_skip = (
                     not include_seen_notified
                     and storage.has_user_offer_notification(user_id, offer.id)
@@ -74,10 +83,9 @@ async def check_once(
 
         storage.save_check_log("ok", offers_count, notified_count)
         logger.info(
-            "check completed offers_count=%s notified_count=%s threshold=%s subscribers=%s include_seen_unnotified=%s include_seen_notified=%s",
+            "check completed offers_count=%s notified_count=%s subscribers=%s include_seen_unnotified=%s include_seen_notified=%s",
             offers_count,
             notified_count,
-            threshold,
             len(active_subscribers),
             include_seen_unnotified,
             include_seen_notified,
@@ -118,3 +126,10 @@ def is_available(offer: Offer) -> bool:
     if any(marker in status for marker in ("инвестировать", "available", "active")):
         return True
     return True
+
+
+def _resolve_threshold(value: object, default: float) -> float:
+    try:
+        return float(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default

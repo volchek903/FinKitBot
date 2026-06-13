@@ -27,25 +27,131 @@ def create_dispatcher() -> Any:
     from aiogram import Dispatcher, F, Router
     from aiogram.filters import Command, CommandStart
     from aiogram.filters.command import CommandObject
+    from aiogram.fsm.context import FSMContext
+    from aiogram.fsm.state import State, StatesGroup
+    from aiogram.fsm.storage.memory import MemoryStorage
     from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+
+    class ThresholdInputState(StatesGroup):
+        waiting_for_threshold = State()
 
     router = Router()
 
     @router.message(CommandStart())
-    async def start(message: Message) -> None:
+    async def start(message: Message, state: FSMContext) -> None:
+        await state.clear()
         if not _is_private_chat(message):
             await message.answer(_private_only_text())
             return
 
         settings = get_settings()
-        threshold = storage.get_threshold(settings.default_score_threshold)
+        threshold = _user_threshold(message.from_user.id if message.from_user else 0, settings)
         await message.answer(
             _build_welcome_text(settings=settings, threshold=threshold),
-            reply_markup=_build_start_keyboard(InlineKeyboardMarkup, InlineKeyboardButton),
+            reply_markup=_build_settings_keyboard(
+                InlineKeyboardMarkup,
+                InlineKeyboardButton,
+                threshold=threshold,
+            ),
+        )
+
+    @router.message(Command("settings"))
+    async def settings_command(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        if not _is_private_chat(message):
+            await message.answer(_private_only_text())
+            return
+
+        settings = get_settings()
+        user_id = message.from_user.id if message.from_user else 0
+        threshold = _user_threshold(user_id, settings)
+        subscriber = storage.get_subscriber(user_id)
+        await message.answer(
+            _build_settings_text(settings=settings, threshold=threshold, subscriber=subscriber),
+            reply_markup=_build_settings_keyboard(
+                InlineKeyboardMarkup,
+                InlineKeyboardButton,
+                threshold=threshold,
+            ),
+        )
+
+    @router.callback_query(F.data == "settings_threshold")
+    async def settings_threshold(callback: CallbackQuery, state: FSMContext) -> None:
+        message = callback.message
+        user = callback.from_user
+        if message is None or user is None:
+            await callback.answer()
+            return
+        if not _is_private_chat(message):
+            await callback.answer("Настройка доступна только в личных сообщениях.", show_alert=True)
+            return
+
+        await state.set_state(ThresholdInputState.waiting_for_threshold)
+        await message.answer("Введите порог скор балла числом от 0 до 100.")
+        await callback.answer()
+
+    @router.message(ThresholdInputState.waiting_for_threshold)
+    async def save_threshold_input(message: Message, state: FSMContext) -> None:
+        if not _is_private_chat(message):
+            await state.clear()
+            await message.answer(_private_only_text())
+            return
+
+        raw_value = (message.text or "").strip().replace(",", ".")
+        try:
+            value = float(raw_value)
+        except ValueError:
+            await message.answer("Введите число от 0 до 100.")
+            return
+
+        if value < 0 or value > 100:
+            await message.answer("Порог должен быть в диапазоне от 0 до 100.")
+            return
+
+        user = message.from_user
+        user_id = user.id if user else 0
+        storage.set_user_threshold(
+            user_id=user_id,
+            chat_id=user_id,
+            value=value,
+            username=user.username if user else None,
+            first_name=user.first_name if user else None,
+        )
+        await state.clear()
+
+        settings = get_settings()
+        subscriber = storage.get_subscriber(user_id)
+        lines = [f"Порог сохранен: {_format_number(value)}."]
+        if storage.is_trial_active(user_id):
+            lines.append("Новое значение уже используется. Запускаю проверку по обновленному порогу.")
+
+            from app.monitor import check_once
+
+            try:
+                offers_count, notified_count = await check_once(bot=message.bot)
+                lines.append(
+                    f"Проверка выполнена: найдено {offers_count}, уведомлений отправлено {notified_count}."
+                )
+            except Exception as exc:
+                lines.append(f"Порог сохранен, но проверка завершилась ошибкой: {exc}")
+        elif subscriber and subscriber.get("started_at"):
+            lines.append(_build_trial_ended_text(settings))
+        else:
+            lines.append("Нажмите «Начать работу», чтобы запустить поиск.")
+
+        await message.answer(
+            "\n\n".join(lines)
+            + "\n\n"
+            + _build_settings_text(settings=settings, threshold=value, subscriber=subscriber),
+            reply_markup=_build_settings_keyboard(
+                InlineKeyboardMarkup,
+                InlineKeyboardButton,
+                threshold=value,
+            ),
         )
 
     @router.callback_query(F.data == "start_work")
-    async def start_work(callback: CallbackQuery) -> None:
+    async def start_work(callback: CallbackQuery, state: FSMContext) -> None:
         message = callback.message
         user = callback.from_user
         if message is None or user is None:
@@ -55,6 +161,7 @@ def create_dispatcher() -> Any:
             await callback.answer("Активируйте бота в личных сообщениях.", show_alert=True)
             return
 
+        await state.clear()
         settings = get_settings()
         activation = storage.activate_trial(
             user_id=user.id,
@@ -63,35 +170,51 @@ def create_dispatcher() -> Any:
             first_name=user.first_name,
             duration_hours=settings.trial_duration_hours,
         )
-        threshold = storage.get_threshold(settings.default_score_threshold)
+        threshold = _user_threshold(user.id, settings)
 
         if activation["state"] == "expired":
             await message.answer(_build_trial_ended_text(settings))
-        else:
-            await message.answer(
-                _build_active_trial_text(
-                    threshold=threshold,
-                    settings=settings,
-                    subscriber=activation["subscriber"],
-                    just_started=activation["state"] == "started",
-                )
-            )
+            await callback.answer()
+            return
+
+        await message.answer(
+            _build_active_trial_text(
+                threshold=threshold,
+                settings=settings,
+                subscriber=activation["subscriber"],
+                just_started=activation["state"] == "started",
+            ),
+            reply_markup=_build_settings_keyboard(
+                InlineKeyboardMarkup,
+                InlineKeyboardButton,
+                threshold=threshold,
+            ),
+        )
+
+        if activation["state"] == "started":
+            from app.monitor import check_once
+
+            try:
+                await check_once(bot=message.bot)
+            except Exception as exc:
+                await message.answer(f"Поиск запущен, но первая проверка завершилась ошибкой: {exc}")
         await callback.answer()
 
     @router.message(Command("status"))
     async def status(message: Message) -> None:
         settings = get_settings()
-        threshold = storage.get_threshold(settings.default_score_threshold)
+        default_threshold = storage.get_threshold(settings.default_score_threshold)
         last_check = storage.get_last_check()
         last_check_time = last_check["checked_at"] if last_check else "нет данных"
         user_id = message.from_user.id if message.from_user else 0
         admin_access = is_authorized(user_id=user_id, chat_id=message.chat.id, settings=settings)
         subscriber = storage.get_subscriber(user_id)
+        user_threshold = _user_threshold(user_id, settings)
 
         if admin_access:
             await message.answer(
                 "Статус: работает\n"
-                f"Текущий порог: {_format_number(threshold)}\n"
+                f"Порог по умолчанию: {_format_number(default_threshold)}\n"
                 f"Интервал проверки: {settings.check_interval_seconds} сек.\n"
                 f"Последняя проверка: {last_check_time}"
             )
@@ -103,8 +226,8 @@ def create_dispatcher() -> Any:
 
         if storage.is_trial_active(user_id):
             await message.answer(
-                "Статус: бесплатный доступ активен\n"
-                f"Бот ищет предложения со скор баллом {_comparator(settings)} {_format_number(threshold)}.\n"
+                "Статус: поиск активен\n"
+                f"Ваш порог: {_format_number(user_threshold)}\n"
                 f"Проверка запускается каждые {settings.check_interval_seconds} сек.\n"
                 f"Доступ до: {_format_datetime(subscriber.get('expires_at') if subscriber else None)}\n"
                 f"Последняя проверка: {last_check_time}"
@@ -116,8 +239,8 @@ def create_dispatcher() -> Any:
             return
 
         await message.answer(
-            "Доступ еще не активирован.\n"
-            "Нажмите /start и кнопку «Начать работу», чтобы открыть бесплатный период на 24 часа."
+            "Поиск еще не запущен.\n"
+            "Откройте /settings, настройте порог и нажмите «Начать работу»."
         )
 
     @router.message(Command("threshold"))
@@ -139,7 +262,7 @@ def create_dispatcher() -> Any:
 
         storage.set_threshold(value)
         await message.answer(
-            f"Порог скор балла изменен на {_format_number(value)}.\n"
+            f"Порог по умолчанию изменен на {_format_number(value)}.\n"
             "Запускаю повторную проверку для активных пользователей."
         )
 
@@ -211,7 +334,8 @@ def create_dispatcher() -> Any:
         )
 
     @router.message(Command("help"))
-    async def help_command(message: Message) -> None:
+    async def help_command(message: Message, state: FSMContext) -> None:
+        await state.clear()
         if not _is_admin_message(message) and not _is_private_chat(message):
             await message.answer(_private_only_text())
             return
@@ -219,15 +343,16 @@ def create_dispatcher() -> Any:
         settings = get_settings()
         lines = [
             "Команды:",
-            "/start - главное меню и кнопка запуска",
-            "/status - статус бесплатного периода",
+            "/start - приветствие и меню",
+            "/settings - настроить порог и запустить поиск",
+            "/status - статус поиска и срока доступа",
             "/last - последние 5 найденных предложений",
             "/help - список команд",
         ]
         if _is_admin_message(message):
             lines.extend(
                 [
-                    "/threshold 70 - изменить порог скор балла",
+                    "/threshold 70 - изменить порог по умолчанию",
                     "/check - запустить проверку вручную",
                     "/chat_id - показать ID текущего чата",
                 ]
@@ -238,7 +363,7 @@ def create_dispatcher() -> Any:
             )
         await message.answer("\n".join(lines))
 
-    dp = Dispatcher()
+    dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     return dp
 
@@ -249,6 +374,7 @@ async def register_bot_commands(bot: Any) -> None:
     await bot.set_my_commands(
         [
             BotCommand(command="start", description="Главное меню"),
+            BotCommand(command="settings", description="Порог и запуск"),
             BotCommand(command="status", description="Статус доступа"),
             BotCommand(command="last", description="Последние предложения"),
             BotCommand(command="help", description="Список команд"),
@@ -256,9 +382,10 @@ async def register_bot_commands(bot: Any) -> None:
     )
 
 
-def _build_start_keyboard(markup_cls: Any, button_cls: Any) -> Any:
+def _build_settings_keyboard(markup_cls: Any, button_cls: Any, *, threshold: float) -> Any:
     return markup_cls(
         inline_keyboard=[
+            [button_cls(text=f"Порог: {_format_number(threshold)}", callback_data="settings_threshold")],
             [button_cls(text="Начать работу", callback_data="start_work")],
         ]
     )
@@ -268,8 +395,31 @@ def _build_welcome_text(settings: Settings, threshold: float) -> str:
     return (
         "FinKit Score Bot отслеживает новые предложения FinKit и присылает в личные сообщения те, "
         f"у которых скор балл {_comparator(settings)} {_format_number(threshold)}.\n\n"
-        f"После активации вы получите {settings.trial_duration_hours} часа(ов) "
-        "бесплатного доступа. Нажмите кнопку «Начать работу»."
+        f"После активации вы получите {settings.trial_duration_hours} часа(ов) бесплатного доступа.\n"
+        "Настройте порог в меню ниже и нажмите «Начать работу»."
+    )
+
+
+def _build_settings_text(
+    *,
+    settings: Settings,
+    threshold: float,
+    subscriber: dict[str, Any] | None,
+) -> str:
+    if subscriber and subscriber.get("started_at") and storage.is_trial_active(int(subscriber["user_id"])):
+        status_text = (
+            "Поиск уже активен.\n"
+            f"Доступ до: {_format_datetime(subscriber.get('expires_at'))}\n"
+        )
+    elif subscriber and subscriber.get("started_at"):
+        status_text = "Бесплатный период уже закончился.\n"
+    else:
+        status_text = "Поиск еще не запущен.\n"
+
+    return (
+        f"{status_text}"
+        f"Текущий порог: {_format_number(threshold)}.\n"
+        "Нажмите кнопку с порогом, чтобы изменить значение, затем нажмите «Начать работу»."
     )
 
 
@@ -281,7 +431,7 @@ def _build_active_trial_text(
     just_started: bool,
 ) -> str:
     expires_at = subscriber.get("expires_at") if subscriber else None
-    intro = "Бесплатный доступ активирован." if just_started else "Бесплатный доступ уже активен."
+    intro = "Поиск запущен." if just_started else "Поиск уже активен."
     return (
         f"{intro}\n\n"
         f"Сейчас бот ищет все предложения со скор баллом {_comparator(settings)} "
@@ -321,6 +471,10 @@ def _comparator(settings: Settings) -> str:
     return ">=" if settings.score_compare_mode == "gte" else ">"
 
 
+def _user_threshold(user_id: int, settings: Settings) -> float:
+    return storage.get_user_threshold(user_id, storage.get_threshold(settings.default_score_threshold))
+
+
 async def _ensure_user_access(message: Any) -> bool:
     if _is_admin_message(message):
         return True
@@ -340,9 +494,7 @@ async def _ensure_user_access(message: Any) -> bool:
         await message.answer(_build_trial_ended_text(get_settings()))
         return False
 
-    await message.answer(
-        "Сначала активируйте доступ через /start и кнопку «Начать работу»."
-    )
+    await message.answer("Сначала откройте /settings, задайте порог и нажмите «Начать работу».")
     return False
 
 
@@ -362,4 +514,4 @@ def _is_private_chat(message: Any) -> bool:
 
 
 def _private_only_text() -> str:
-    return "Эта функция работает только в личных сообщениях с ботом. Напишите боту в ЛС и нажмите /start."
+    return "Эта функция работает только в личных сообщениях с ботом. Напишите боту в ЛС и используйте /start или /settings."

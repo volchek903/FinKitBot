@@ -17,6 +17,16 @@ def _activate_user(user_id: int, chat_id: int | None = None) -> None:
     )
 
 
+def _set_user_threshold(user_id: int, value: float) -> None:
+    storage.set_user_threshold(
+        user_id=user_id,
+        chat_id=user_id,
+        value=value,
+        username=None,
+        first_name=None,
+    )
+
+
 def test_regular_check_notifies_active_user_once(monkeypatch, tmp_path) -> None:
     get_settings.cache_clear()
     monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "bot.sqlite3"))
@@ -90,6 +100,43 @@ def test_regular_check_notifies_new_user_for_existing_offer(monkeypatch, tmp_pat
     assert notified_count == 1
     assert notified == [(101, offer.id), (202, offer.id)]
     assert storage.has_user_offer_notification(202, offer.id) is True
+
+
+def test_regular_check_uses_personal_thresholds(monkeypatch, tmp_path) -> None:
+    get_settings.cache_clear()
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "bot.sqlite3"))
+    monkeypatch.setenv("DEFAULT_SCORE_THRESHOLD", "50")
+    storage.init_db()
+    _activate_user(user_id=101)
+    _activate_user(user_id=202)
+    _set_user_threshold(user_id=101, value=44)
+    _set_user_threshold(user_id=202, value=70)
+
+    offer = Offer(id="personal-threshold", score=60, status="available")
+    notified: list[tuple[int, str, float]] = []
+
+    async def fake_get_offers() -> list[Offer]:
+        return [offer]
+
+    async def fake_notify_offer(
+        offer: Offer,
+        threshold: float,
+        *,
+        chat_id: int | None = None,
+        bot: object | None = None,
+    ) -> None:
+        notified.append((chat_id or 0, offer.id, threshold))
+
+    monkeypatch.setattr("app.finkit_client.get_offers", fake_get_offers)
+    monkeypatch.setattr("app.notifier.notify_offer", fake_notify_offer)
+
+    offers_count, notified_count = asyncio.run(check_once())
+
+    assert offers_count == 1
+    assert notified_count == 1
+    assert notified == [(101, offer.id, 44)]
+    assert storage.has_user_offer_notification(101, offer.id) is True
+    assert storage.has_user_offer_notification(202, offer.id) is False
 
 
 def test_threshold_change_resends_offer_to_active_user(monkeypatch, tmp_path) -> None:
