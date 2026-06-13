@@ -30,7 +30,9 @@ class Settings(BaseSettings):
 
     default_score_threshold: float = 65
     score_compare_mode: str = "gte"
-    check_interval_seconds: int = 30
+    check_interval_seconds: int = 60
+    trial_duration_hours: int = 24
+    trial_manager_contact: str = "менеджеру"
 
     database_path: str = "data/bot.sqlite3"
     playwright_state_path: str = "data/playwright_state.json"

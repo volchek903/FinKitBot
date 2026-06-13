@@ -10,7 +10,7 @@ from app.notifier import notify_admin_error
 logger = logging.getLogger(__name__)
 
 
-async def monitoring_loop() -> None:
+async def monitoring_loop(telegram_bot: object) -> None:
     settings = get_settings()
     backoff_seconds = 60
 
@@ -18,7 +18,7 @@ async def monitoring_loop() -> None:
         try:
             from app.monitor import check_once
 
-            await check_once()
+            await check_once(bot=telegram_bot)
             backoff_seconds = 60
             await asyncio.sleep(settings.check_interval_seconds)
         except asyncio.CancelledError:
@@ -42,7 +42,7 @@ async def main() -> None:
 
     telegram_bot = TelegramBot(token=settings.telegram_bot_token)
     dispatcher = create_dispatcher()
-    monitor_task = asyncio.create_task(monitoring_loop())
+    monitor_task = asyncio.create_task(monitoring_loop(telegram_bot))
 
     try:
         await register_bot_commands(telegram_bot)
@@ -55,4 +55,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
