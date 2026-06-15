@@ -5,7 +5,7 @@ from app import storage
 from app.bot import create_dispatcher, register_bot_commands
 from app.config import get_settings
 from app.logging_config import setup_logging
-from app.notifier import notify_admin_error
+from app.notifier import create_telegram_bot, notify_admin_error
 
 logger = logging.getLogger(__name__)
 
@@ -38,9 +38,7 @@ async def main() -> None:
     if not settings.telegram_bot_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
 
-    from aiogram import Bot as TelegramBot
-
-    telegram_bot = TelegramBot(token=settings.telegram_bot_token)
+    telegram_bot = create_telegram_bot(token=settings.telegram_bot_token)
     dispatcher = create_dispatcher()
     monitor_task = asyncio.create_task(monitoring_loop(telegram_bot))
 

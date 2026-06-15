@@ -29,6 +29,19 @@ class OfferBatchSession:
     created_at: float
 
 
+def create_telegram_bot(*, token: str | None = None) -> Any:
+    settings = get_settings()
+    bot_token = token or settings.telegram_bot_token
+    if not bot_token:
+        raise RuntimeError("Telegram bot token is not configured")
+
+    from aiogram import Bot as TelegramBot
+    from aiogram.client.session.aiohttp import AiohttpSession
+
+    session = AiohttpSession(proxy=settings.telegram_proxy or None)
+    return TelegramBot(token=bot_token, session=session)
+
+
 async def notify_offer(
     offer: Offer,
     threshold: float,
@@ -165,10 +178,9 @@ async def copy_message_to_chat(
             return
         raise RuntimeError(message)
 
-    from aiogram import Bot as TelegramBot
     from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 
-    telegram_bot = bot or TelegramBot(token=settings.telegram_bot_token)
+    telegram_bot = bot or create_telegram_bot(token=settings.telegram_bot_token)
     should_close_session = bot is None
     network_error_attempt = 0
     network_retry_delay = TELEGRAM_NETWORK_RETRY_DELAY_SECONDS
@@ -225,10 +237,9 @@ async def _send_text(
             return
         raise RuntimeError(message)
 
-    from aiogram import Bot as TelegramBot
     from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 
-    telegram_bot = bot or TelegramBot(token=settings.telegram_bot_token)
+    telegram_bot = bot or create_telegram_bot(token=settings.telegram_bot_token)
     should_close_session = bot is None
     network_error_attempt = 0
     network_retry_delay = TELEGRAM_NETWORK_RETRY_DELAY_SECONDS

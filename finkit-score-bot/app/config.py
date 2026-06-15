@@ -1,6 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -27,6 +28,7 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     telegram_allowed_user_ids: tuple[int, ...] = Field(default_factory=tuple)
+    telegram_proxy: str = ""
 
     default_score_threshold: float = 65
     score_compare_mode: str = "gte"
@@ -57,6 +59,23 @@ class Settings(BaseSettings):
     def normalize_compare_mode(cls, value: str) -> str:
         normalized = value.lower().strip()
         return "gte" if normalized == "gte" else "gt"
+
+    @field_validator("telegram_proxy", mode="before")
+    @classmethod
+    def normalize_telegram_proxy(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        normalized = str(value).strip()
+        if not normalized:
+            return ""
+        if "://" in normalized:
+            return normalized
+
+        parts = normalized.split(":")
+        if len(parts) == 4:
+            host, port, username, password = parts
+            return f"http://{quote(username, safe='')}:{quote(password, safe='')}@{host}:{port}"
+        return normalized
 
     @property
     def telegram_chat_id_int(self) -> int | None:
