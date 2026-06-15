@@ -367,6 +367,7 @@ def create_dispatcher() -> Any:
             await callback.answer("Неизвестное поле.", show_alert=True)
             return
 
+        await callback.answer()
         settings = get_settings()
         filters = await _resolved_filters(user.id, settings)
         await state.set_state(FilterInputState.waiting_for_value)
@@ -375,7 +376,6 @@ def create_dispatcher() -> Any:
             filter_key=field_key,
             prompt_message_id=prompt_message.message_id,
         )
-        await callback.answer()
 
     @router.message(FilterInputState.waiting_for_value)
     async def save_filter_input(message: Message, state: FSMContext) -> None:
@@ -428,17 +428,15 @@ def create_dispatcher() -> Any:
             f"✅ {filter_field_label(field_key)}: {format_filter_value(field_key, value)}."
         ]
         if is_trial_running:
-            lines.append("🔄 Новое значение уже применяется. Запускаю внеочередную проверку.")
-
-            from app.monitor import check_once
-
-            try:
-                offers_count, notified_count = await check_once(bot=message.bot)
-                lines.append(
-                    f"📊 Проверка выполнена: найдено {offers_count}, уведомлений отправлено {notified_count}."
-                )
-            except Exception as exc:
-                lines.append(f"⚠️ Настройка сохранена, но проверка завершилась ошибкой: {exc}")
+            lines.append("🔄 Новое значение сохранено. Обновляю поиск в фоне, результат пришлю отдельным сообщением.")
+            _start_background_task(
+                _run_background_user_recheck(
+                    bot=message.bot,
+                    chat_id=message.chat.id,
+                    prefix_text="✅ Параметр обновлен.",
+                ),
+                task_name=f"user-recheck:{message.chat.id}",
+            )
         elif is_trial_active:
             lines.append("⏸️ Поиск сейчас остановлен. Нажмите «Запустить поиск», чтобы снова его включить.")
         elif subscriber and subscriber.get("started_at"):
@@ -508,45 +506,24 @@ def create_dispatcher() -> Any:
                 filters=filters,
                 subscriber=activation["subscriber"],
                 just_started=just_started,
+                result_text="🔄 Запускаю проверку в фоне...",
             ),
             reply_markup=reply_markup,
         )
 
-        from app.monitor import check_after_threshold_change, check_once
-
-        try:
-            if just_started:
-                offers_count, notified_count = await check_once(bot=message.bot)
-            else:
-                offers_count, notified_count = await check_after_threshold_change(bot=message.bot)
-        except Exception as exc:
-            await _edit_message_text(
-                message,
-                text=_build_start_work_message_text(
-                    settings=settings,
-                    filters=filters,
-                    subscriber=activation["subscriber"],
-                    just_started=just_started,
-                    result_text=f"Поиск запущен, но проверка завершилась ошибкой: {exc}",
-                ),
+        _start_background_task(
+            _run_background_start_check(
+                bot=message.bot,
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                settings=settings,
+                filters=filters,
+                subscriber=activation["subscriber"],
+                just_started=just_started,
                 reply_markup=reply_markup,
-            )
-        else:
-            await _edit_message_text(
-                message,
-                text=_build_start_work_message_text(
-                    settings=settings,
-                    filters=filters,
-                    subscriber=activation["subscriber"],
-                    just_started=just_started,
-                    result_text=_build_start_check_result_text(
-                        just_started=just_started,
-                        offers_count=offers_count,
-                        notified_count=notified_count,
-                    ),
-                ),
-                reply_markup=reply_markup,
-            )
+            ),
+            task_name=f"start-check:{message.chat.id}:{message.message_id}",
+        )
 
     @router.callback_query(F.data.startswith("offer_batch:"))
     async def offer_batch_page(callback: CallbackQuery) -> None:
@@ -612,17 +589,15 @@ def create_dispatcher() -> Any:
         lines = ["🧹 Все фильтры сброшены."]
 
         if is_trial_running:
-            lines.append("🔄 Новые значения уже применяются. Запускаю внеочередную проверку.")
-
-            from app.monitor import check_once
-
-            try:
-                offers_count, notified_count = await check_once(bot=message.bot)
-                lines.append(
-                    f"📊 Проверка выполнена: найдено {offers_count}, уведомлений отправлено {notified_count}."
-                )
-            except Exception as exc:
-                lines.append(f"⚠️ Фильтры сброшены, но проверка завершилась ошибкой: {exc}")
+            lines.append("🔄 Фильтры сброшены. Обновляю поиск в фоне, результат пришлю отдельным сообщением.")
+            _start_background_task(
+                _run_background_user_recheck(
+                    bot=message.bot,
+                    chat_id=message.chat.id,
+                    prefix_text="🧹 Фильтры сброшены.",
+                ),
+                task_name=f"user-recheck:{message.chat.id}",
+            )
         elif is_trial_active:
             lines.append("⏸️ Поиск сейчас остановлен. Нажмите «Запустить поиск», чтобы снова его включить.")
         elif subscriber and subscriber.get("started_at"):
@@ -830,6 +805,23 @@ def create_dispatcher() -> Any:
                 f"🎁 После активации бесплатный доступ работает {settings.trial_duration_hours} часа(ов)."
             )
         await message.answer("\n".join(lines))
+
+    @router.message(F.text)
+    async def plain_text_fallback(message: Message, state: FSMContext) -> None:
+        text = (message.text or "").strip()
+        if not text or text.startswith("/"):
+            return
+        if not _is_private_chat(message):
+            return
+
+        current_state = await state.get_state()
+        if current_state:
+            return
+
+        await message.answer(
+            "✍️ Сначала нажмите нужную кнопку параметра, потом отправьте значение.\n"
+            "Если хотите открыть настройки заново, используйте /settings."
+        )
 
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
@@ -1278,6 +1270,99 @@ async def _broadcast_message_copy(message: Any, user_ids: list[int]) -> tuple[in
         else:
             sent_count += 1
     return sent_count, failed_ids
+
+
+def _start_background_task(task: Any, *, task_name: str) -> None:
+    created_task = asyncio.create_task(task, name=task_name)
+
+    def on_done(done_task: asyncio.Task[Any]) -> None:
+        try:
+            done_task.result()
+        except Exception:
+            logger.exception("background task failed task_name=%s", task_name)
+
+    created_task.add_done_callback(on_done)
+
+
+async def _run_background_user_recheck(
+    *,
+    bot: Any,
+    chat_id: int,
+    prefix_text: str,
+) -> None:
+    from app.monitor import check_once
+
+    try:
+        offers_count, notified_count = await check_once(bot=bot)
+    except Exception as exc:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"{prefix_text}\n\n⚠️ Фоновая проверка завершилась ошибкой: {exc}",
+        )
+        return
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"{prefix_text}\n\n"
+            f"✅ Фоновая проверка завершена.\n"
+            f"📊 Найдено предложений: {offers_count}\n"
+            f"📬 Уведомлений отправлено: {notified_count}"
+        ),
+    )
+
+
+async def _run_background_start_check(
+    *,
+    bot: Any,
+    chat_id: int,
+    message_id: int,
+    settings: Settings,
+    filters: dict[str, Any],
+    subscriber: dict[str, Any] | None,
+    just_started: bool,
+    reply_markup: Any,
+) -> None:
+    from app.monitor import check_after_threshold_change, check_once
+
+    try:
+        if just_started:
+            offers_count, notified_count = await check_once(bot=bot)
+        else:
+            offers_count, notified_count = await check_after_threshold_change(bot=bot)
+    except Exception as exc:
+        text = _build_start_work_message_text(
+            settings=settings,
+            filters=filters,
+            subscriber=subscriber,
+            just_started=just_started,
+            result_text=f"⚠️ Поиск запущен, но проверка завершилась ошибкой: {exc}",
+        )
+    else:
+        text = _build_start_work_message_text(
+            settings=settings,
+            filters=filters,
+            subscriber=subscriber,
+            just_started=just_started,
+            result_text=_build_start_check_result_text(
+                just_started=just_started,
+                offers_count=offers_count,
+                notified_count=notified_count,
+            ),
+        )
+
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:
+        if "message is not modified" in str(exc).lower():
+            return
+        logger.exception("failed to update start check message chat_id=%s message_id=%s", chat_id, message_id)
 
 
 def _build_settings_keyboard(markup_cls: Any, button_cls: Any, *, filters: dict[str, Any]) -> Any:
