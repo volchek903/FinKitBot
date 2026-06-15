@@ -75,6 +75,9 @@ async def _check_once_impl(
 
         for subscriber in active_subscribers:
             user_id = int(subscriber["user_id"])
+            if not await storage.ais_trial_running(user_id):
+                logger.info("skipping paused subscriber during active check user_id=%s", user_id)
+                continue
             user_offers = pending_notifications.get(user_id, [])
             if not user_offers:
                 continue

@@ -34,6 +34,7 @@ COMMAND_SYNC_RETRIES = 3
 COMMAND_SYNC_RETRY_DELAY_SECONDS = 2
 
 logger = logging.getLogger(__name__)
+_USER_BACKGROUND_TASKS: dict[int, set[asyncio.Task[Any]]] = {}
 
 
 def is_authorized(user_id: int, chat_id: int, settings: Settings | None = None) -> bool:
@@ -75,6 +76,7 @@ def create_dispatcher() -> Any:
             return
 
         user_id = message.from_user.id if message.from_user else 0
+        _cancel_user_background_tasks(user_id)
         search_was_running = await storage.apause_user_search(user_id)
         settings = get_settings()
         filters = await _resolved_filters(user_id, settings)
@@ -436,6 +438,7 @@ def create_dispatcher() -> Any:
                     prefix_text="✅ Параметр обновлен.",
                 ),
                 task_name=f"user-recheck:{message.chat.id}",
+                user_id=user_id,
             )
         elif is_trial_active:
             lines.append("⏸️ Поиск сейчас остановлен. Нажмите «Запустить поиск», чтобы снова его включить.")
@@ -482,11 +485,6 @@ def create_dispatcher() -> Any:
             duration_hours=settings.trial_duration_hours,
         )
         filters = await _resolved_filters(user.id, settings)
-        reply_markup = _build_settings_keyboard(
-            InlineKeyboardMarkup,
-            InlineKeyboardButton,
-            filters=filters,
-        )
         just_started = activation["state"] == "started"
 
         if activation["state"] == "expired":
@@ -494,7 +492,7 @@ def create_dispatcher() -> Any:
             await _edit_message_text(
                 message,
                 text=_build_trial_ended_text(settings),
-                reply_markup=reply_markup,
+                reply_markup=None,
             )
             return
 
@@ -508,7 +506,7 @@ def create_dispatcher() -> Any:
                 just_started=just_started,
                 result_text="🔄 Запускаю проверку в фоне...",
             ),
-            reply_markup=reply_markup,
+            reply_markup=None,
         )
 
         _start_background_task(
@@ -520,9 +518,10 @@ def create_dispatcher() -> Any:
                 filters=filters,
                 subscriber=activation["subscriber"],
                 just_started=just_started,
-                reply_markup=reply_markup,
+                reply_markup=None,
             ),
             task_name=f"start-check:{message.chat.id}:{message.message_id}",
+            user_id=user.id,
         )
 
     @router.callback_query(F.data.startswith("offer_batch:"))
@@ -597,6 +596,7 @@ def create_dispatcher() -> Any:
                     prefix_text="🧹 Фильтры сброшены.",
                 ),
                 task_name=f"user-recheck:{message.chat.id}",
+                user_id=user.id,
             )
         elif is_trial_active:
             lines.append("⏸️ Поиск сейчас остановлен. Нажмите «Запустить поиск», чтобы снова его включить.")
@@ -1272,16 +1272,32 @@ async def _broadcast_message_copy(message: Any, user_ids: list[int]) -> tuple[in
     return sent_count, failed_ids
 
 
-def _start_background_task(task: Any, *, task_name: str) -> None:
+def _start_background_task(task: Any, *, task_name: str, user_id: int | None = None) -> None:
     created_task = asyncio.create_task(task, name=task_name)
+    if user_id is not None:
+        _USER_BACKGROUND_TASKS.setdefault(user_id, set()).add(created_task)
 
     def on_done(done_task: asyncio.Task[Any]) -> None:
+        if user_id is not None:
+            user_tasks = _USER_BACKGROUND_TASKS.get(user_id)
+            if user_tasks is not None:
+                user_tasks.discard(done_task)
+                if not user_tasks:
+                    _USER_BACKGROUND_TASKS.pop(user_id, None)
         try:
             done_task.result()
+        except asyncio.CancelledError:
+            logger.info("background task cancelled task_name=%s", task_name)
         except Exception:
             logger.exception("background task failed task_name=%s", task_name)
 
     created_task.add_done_callback(on_done)
+
+
+def _cancel_user_background_tasks(user_id: int) -> None:
+    user_tasks = _USER_BACKGROUND_TASKS.pop(user_id, set())
+    for task in user_tasks:
+        task.cancel()
 
 
 async def _run_background_user_recheck(
@@ -1397,8 +1413,9 @@ def _build_welcome_text(
     )
     if search_was_stopped:
         text = (
-            "⏸️ Поиск был остановлен для этого пользователя.\n"
-            "▶️ Чтобы включить его снова, нажмите «Запустить поиск».\n\n"
+            "⏹️ Поиск остановлен.\n"
+            "🔕 Новые заявки больше не отслеживаются.\n"
+            "▶️ Чтобы снова включить бота, нажмите «Запустить поиск».\n\n"
             + text
         )
     return text
@@ -1454,15 +1471,21 @@ def _build_active_trial_text(
     just_started: bool,
 ) -> str:
     expires_at = subscriber.get("expires_at") if subscriber else None
-    intro = "✅ Поиск запущен." if just_started else "🟢 Поиск уже активен."
+    intro = "🤖 Бот активирован." if just_started else "🤖 Бот уже активен."
     return (
         f"{intro}\n\n"
-        f"⏱ Проверка каждые {settings.check_interval_seconds} сек.\n"
+        "⚙️ Текущие фильтры\n"
         f"🎯 Скор: {_format_filter_range(filters, 'borrower_score_min', 'borrower_score_max')}\n"
         f"💰 Сумма: {_format_filter_range(filters, 'amount_min', 'amount_max')}\n"
         f"📆 Срок: {_format_filter_range(filters, 'term_min', 'term_max')}\n"
         f"📈 Ставка: {_format_filter_range(filters, 'interest_rate_min', 'interest_rate_max')}\n"
-        "📬 Как только появится подходящее предложение, я отправлю его в личные сообщения.\n"
+        f"🏷️ Рейтинг: {_format_filter_range(filters, 'borrower_rating_min', 'borrower_rating_max')}\n"
+        f"💼 Инвест: {_format_filter_range(filters, 'invest_min', 'invest_max')}\n"
+        f"💳 Доход подтвержден: {_format_filter_brief(filters, 'borrower_income_confirmed')}\n"
+        f"📄 Исп. пр-ва: {_format_filter_brief(filters, 'borrower_enforcement_up_to_1_month_absent')}\n"
+        f"🪪 Возраст: {_format_filter_brief(filters, 'borrower_age_group')}\n\n"
+        f"⏱ Проверка каждые {settings.check_interval_seconds} сек.\n"
+        "📬 Подходящие заявки пришлю в личные сообщения.\n"
         f"⌛ Доступ действует до: {_format_datetime(expires_at)}"
     )
 
