@@ -36,6 +36,8 @@ NETWORK_IDLE_TIMEOUT_MS = 15_000
 POST_NAVIGATION_DELAY_MS = 1_500
 AUTH_COMPLETION_TIMEOUT_MS = 15_000
 AUTH_POLL_INTERVAL_MS = 500
+KNOWN_OFFERS_API_PATH = "/loans-to-invest/"
+DEFAULT_OFFERS_ORDERING = "-signed_at"
 
 
 async def get_offers() -> list[Offer]:
@@ -60,6 +62,11 @@ async def get_offers_from_api_or_dom() -> list[Offer]:
             await _open_offers_page(page)
             await _login_if_needed(page, context)
 
+            direct_api_offers = await _offers_from_known_api(context)
+            if direct_api_offers:
+                logger.info("offers source=direct-api offers_count=%s", len(direct_api_offers))
+                return direct_api_offers
+
             captures = await discover_offers_api(page)
             best_api_offers: list[Offer] = []
             best_api_priority: tuple[int, int, int, int, int] | None = None
@@ -77,6 +84,8 @@ async def get_offers_from_api_or_dom() -> list[Offer]:
                 return _dedupe_offers(best_api_offers)
 
             dom_offers = await _collect_offers_from_dom(page)
+            if not dom_offers:
+                await _log_empty_offers_page(page)
             logger.info("offers source=dom offers_count=%s", len(dom_offers))
             return dom_offers
         finally:
@@ -340,6 +349,14 @@ async def _offers_from_capture(context: Any, capture: dict[str, Any]) -> list[Of
     return _dedupe_offers(offers)
 
 
+async def _offers_from_known_api(context: Any) -> list[Offer]:
+    payloads = await _collect_next_link_payloads(context, _known_offers_api_url())
+    offers: list[Offer] = []
+    for payload in payloads:
+        offers.extend(parse_offers_from_json(payload))
+    return _dedupe_offers(offers)
+
+
 async def _collect_paginated_payloads(context: Any, capture: dict[str, Any]) -> list[Any]:
     first_payload = capture["payload"]
     payloads = [first_payload]
@@ -371,6 +388,29 @@ async def _collect_paginated_payloads(context: Any, capture: dict[str, Any]) -> 
         payload = await _fetch_json(context, method, url, post_data)
         if payload_looks_like_offers(payload):
             payloads.append(payload)
+
+    return payloads
+
+
+async def _collect_next_link_payloads(context: Any, initial_url: str) -> list[Any]:
+    payloads: list[Any] = []
+    seen_urls: set[str] = set()
+    next_url: str | None = initial_url
+
+    while next_url:
+        absolute_next = urljoin(initial_url, next_url)
+        if absolute_next in seen_urls:
+            break
+        seen_urls.add(absolute_next)
+
+        payload = await _fetch_json(context, "GET", absolute_next)
+        if not payload_looks_like_offers(payload):
+            break
+        payloads.append(payload)
+
+        info = _find_pagination_info(payload)
+        next_value = info.get("next") if info else None
+        next_url = str(next_value) if next_value else None
 
     return payloads
 
@@ -661,6 +701,21 @@ async def _save_storage_state(context: Any) -> None:
     await context.storage_state(path=str(state_path))
 
 
+async def _log_empty_offers_page(page: Any) -> None:
+    try:
+        page_title = await page.title()
+    except Exception:
+        page_title = ""
+    body = await _body_text(page)
+    compact_body = re.sub(r"\s+", " ", body).strip()[:400]
+    logger.warning(
+        "offers page returned no api captures and no dom rows url=%s title=%s body_snippet=%s",
+        page.url,
+        page_title,
+        compact_body or "<empty>",
+    )
+
+
 async def _table_signature(page: Any) -> str:
     try:
         rows = await page.locator(ROW_SELECTOR).all_inner_texts()
@@ -709,6 +764,23 @@ def _int_or_none(value: Any) -> int | None:
 
 def _request_key(method: str, url: str, post_data: str | None) -> str:
     return f"{method.upper()} {url} {post_data or ''}"
+
+
+def _known_offers_api_url() -> str:
+    settings = get_settings()
+    source_query = dict(parse_qsl(urlparse(current_offers_url()).query, keep_blank_values=True))
+    source_query.setdefault("ordering", DEFAULT_OFFERS_ORDERING)
+    source_query.setdefault("page", "1")
+    return urlunparse(
+        (
+            urlparse(settings.finkit_api_base_url).scheme,
+            urlparse(settings.finkit_api_base_url).netloc,
+            KNOWN_OFFERS_API_PATH,
+            "",
+            urlencode(source_query, doseq=True),
+            "",
+        )
+    )
 
 
 def _capture_priority(capture: dict[str, Any], target_url: str) -> tuple[int, int, int, int, int]:
