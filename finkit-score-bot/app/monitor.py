@@ -39,57 +39,39 @@ async def _check_once_impl(
         from app.finkit_client import get_offers
         from app.notifier import notify_offer, notify_offer_batch, notify_trial_ended
 
-        expired_subscribers = storage.get_expired_subscribers_pending_notice()
+        expired_subscribers = await storage.aget_expired_subscribers_pending_notice()
         for subscriber in expired_subscribers:
             await notify_trial_ended(
                 chat_id=int(subscriber["user_id"]),
                 manager_contact=settings.trial_manager_contact,
                 bot=bot,
             )
-            storage.mark_trial_ended_notified(int(subscriber["user_id"]))
+            await storage.amark_trial_ended_notified(int(subscriber["user_id"]))
 
-        active_subscribers = storage.get_active_subscribers()
+        active_subscribers, default_threshold, subscriber_filters = await asyncio.to_thread(
+            _load_monitoring_context_sync,
+            settings.default_score_threshold,
+        )
         if not active_subscribers:
-            storage.save_check_log("ok", offers_count, notified_count)
+            await storage.asave_check_log("ok", offers_count, notified_count)
             logger.info("check skipped because there are no active subscribers")
             return offers_count, notified_count
-        default_threshold = storage.get_threshold(settings.default_score_threshold)
-        subscriber_filters = {
-            int(subscriber["user_id"]): _resolved_filters(
-                resolved_user_filters(
-                    storage.get_user_filters(int(subscriber["user_id"])),
-                    default_threshold,
-                )
-            )
-            for subscriber in active_subscribers
-        }
 
         offers = await get_offers()
         offers_count = len(offers)
-        available_offers = [offer for offer in offers if is_available(offer)]
-        removed_count = storage.forget_missing_offers({offer.id for offer in available_offers})
+        removed_count, pending_notifications = await asyncio.to_thread(
+            _prepare_pending_notifications_sync,
+            offers,
+            active_subscribers,
+            subscriber_filters,
+            include_seen_unnotified,
+            include_seen_notified,
+        )
         if removed_count:
             logger.info("removed stale offers from storage removed_count=%s", removed_count)
 
-        pending_notifications: dict[int, list[Offer]] = defaultdict(list)
+        sent_pairs: list[tuple[int, str]] = []
         sent_offer_ids: set[str] = set()
-
-        for offer in available_offers:
-            storage.save_seen(offer)
-            for subscriber in active_subscribers:
-                user_id = int(subscriber["user_id"])
-                filters = subscriber_filters[user_id]
-                if not offer_matches_user_filters(offer, filters):
-                    continue
-                should_skip = (
-                    not include_seen_notified
-                    and storage.has_user_offer_notification(user_id, offer.id)
-                )
-                if should_skip:
-                    continue
-                if include_seen_unnotified and not include_seen_notified:
-                    should_skip = False
-                pending_notifications[user_id].append(offer)
 
         for subscriber in active_subscribers:
             user_id = int(subscriber["user_id"])
@@ -114,18 +96,21 @@ async def _check_once_impl(
                         threshold,
                         chat_id=user_id,
                         filters=filters,
-                        bot=bot,
-                    )
+                    bot=bot,
+                )
 
             for offer in user_offers:
-                storage.mark_user_offer_notified(user_id, offer.id)
+                sent_pairs.append((user_id, offer.id))
                 sent_offer_ids.add(offer.id)
             notified_count += len(user_offers)
 
-        for offer_id in sent_offer_ids:
-            storage.mark_notified(offer_id)
+        await asyncio.to_thread(
+            _mark_notifications_sent_sync,
+            sent_pairs,
+            sent_offer_ids,
+        )
 
-        storage.save_check_log("ok", offers_count, notified_count)
+        await storage.asave_check_log("ok", offers_count, notified_count)
         logger.info(
             "check completed offers_count=%s notified_count=%s subscribers=%s include_seen_unnotified=%s include_seen_notified=%s",
             offers_count,
@@ -136,7 +121,7 @@ async def _check_once_impl(
         )
         return offers_count, notified_count
     except Exception as exc:
-        storage.save_check_log("error", offers_count, notified_count, str(exc))
+        await storage.asave_check_log("error", offers_count, notified_count, str(exc))
         logger.exception("check failed")
         raise
 
@@ -174,6 +159,60 @@ def is_available(offer: Offer) -> bool:
 
 def _resolved_filters(value: object) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _load_monitoring_context_sync(
+    default_score_threshold: float,
+) -> tuple[list[dict[str, Any]], float, dict[int, dict[str, Any]]]:
+    active_subscribers = storage.get_active_subscribers()
+    default_threshold = storage.get_threshold(default_score_threshold)
+    subscriber_filters = {
+        int(subscriber["user_id"]): _resolved_filters(
+            resolved_user_filters(
+                storage.get_user_filters(int(subscriber["user_id"])),
+                default_threshold,
+            )
+        )
+        for subscriber in active_subscribers
+    }
+    return active_subscribers, default_threshold, subscriber_filters
+
+
+def _prepare_pending_notifications_sync(
+    offers: list[Offer],
+    active_subscribers: list[dict[str, Any]],
+    subscriber_filters: dict[int, dict[str, Any]],
+    include_seen_unnotified: bool,
+    include_seen_notified: bool,
+) -> tuple[int, dict[int, list[Offer]]]:
+    del include_seen_unnotified
+
+    available_offers = [offer for offer in offers if is_available(offer)]
+    removed_count = storage.forget_missing_offers({offer.id for offer in available_offers})
+    pending_notifications: dict[int, list[Offer]] = defaultdict(list)
+
+    for offer in available_offers:
+        storage.save_seen(offer)
+        for subscriber in active_subscribers:
+            user_id = int(subscriber["user_id"])
+            filters = subscriber_filters[user_id]
+            if not offer_matches_user_filters(offer, filters):
+                continue
+            if not include_seen_notified and storage.has_user_offer_notification(user_id, offer.id):
+                continue
+            pending_notifications[user_id].append(offer)
+
+    return removed_count, pending_notifications
+
+
+def _mark_notifications_sent_sync(
+    sent_pairs: list[tuple[int, str]],
+    sent_offer_ids: set[str],
+) -> None:
+    for user_id, offer_id in sent_pairs:
+        storage.mark_user_offer_notified(user_id, offer_id)
+    for offer_id in sent_offer_ids:
+        storage.mark_notified(offer_id)
 
 
 def _get_check_lock() -> asyncio.Lock:

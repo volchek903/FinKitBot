@@ -1,3 +1,4 @@
+import asyncio
 import sqlite3
 from datetime import datetime, timedelta, timezone
 import json
@@ -8,11 +9,17 @@ from app.config import get_settings
 from app.models import Offer
 from app.user_filters import empty_user_filters
 
+SQLITE_CONNECT_TIMEOUT_SECONDS = 30
+SQLITE_BUSY_TIMEOUT_MS = 30_000
+
 
 def init_db() -> None:
     path = _database_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with _connect() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS offers_seen (
@@ -636,8 +643,13 @@ def _database_path() -> Path:
 
 
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(_database_path())
+    conn = sqlite3.connect(
+        _database_path(),
+        timeout=SQLITE_CONNECT_TIMEOUT_SECONDS,
+        check_same_thread=False,
+    )
     conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
     return conn
 
 
@@ -770,3 +782,136 @@ def _parse_filters(value: Any) -> dict[str, Any]:
     except (TypeError, ValueError, json.JSONDecodeError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+async def ainit_db() -> None:
+    await asyncio.to_thread(init_db)
+
+
+async def aget_subscriber(user_id: int) -> dict[str, Any] | None:
+    return await asyncio.to_thread(get_subscriber, user_id)
+
+
+async def aactivate_trial(
+    user_id: int,
+    chat_id: int,
+    username: str | None = None,
+    first_name: str | None = None,
+    duration_hours: int = 24,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        activate_trial,
+        user_id,
+        chat_id,
+        username,
+        first_name,
+        duration_hours,
+    )
+
+
+async def aget_active_subscribers() -> list[dict[str, Any]]:
+    return await asyncio.to_thread(get_active_subscribers)
+
+
+async def aget_expired_subscribers_pending_notice() -> list[dict[str, Any]]:
+    return await asyncio.to_thread(get_expired_subscribers_pending_notice)
+
+
+async def amark_trial_ended_notified(user_id: int) -> None:
+    await asyncio.to_thread(mark_trial_ended_notified, user_id)
+
+
+async def aforget_missing_offers(current_offer_ids: set[str]) -> int:
+    return await asyncio.to_thread(forget_missing_offers, current_offer_ids)
+
+
+async def aget_threshold(default: float) -> float:
+    return await asyncio.to_thread(get_threshold, default)
+
+
+async def aget_user_filters(user_id: int) -> dict[str, Any]:
+    return await asyncio.to_thread(get_user_filters, user_id)
+
+
+async def aset_user_filter(
+    user_id: int,
+    chat_id: int,
+    key: str,
+    value: Any,
+    username: str | None = None,
+    first_name: str | None = None,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        set_user_filter,
+        user_id,
+        chat_id,
+        key,
+        value,
+        username,
+        first_name,
+    )
+
+
+async def aset_user_filters(
+    user_id: int,
+    chat_id: int,
+    filters: dict[str, Any],
+    username: str | None = None,
+    first_name: str | None = None,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        set_user_filters,
+        user_id,
+        chat_id,
+        filters,
+        username,
+        first_name,
+    )
+
+
+async def apause_user_search(user_id: int) -> bool:
+    return await asyncio.to_thread(pause_user_search, user_id)
+
+
+async def ais_trial_active(user_id: int) -> bool:
+    return await asyncio.to_thread(is_trial_active, user_id)
+
+
+async def ais_trial_running(user_id: int) -> bool:
+    return await asyncio.to_thread(is_trial_running, user_id)
+
+
+async def aset_threshold(value: float) -> None:
+    await asyncio.to_thread(set_threshold, value)
+
+
+async def asave_check_log(
+    status: str,
+    offers_count: int = 0,
+    notified_count: int = 0,
+    error: str | None = None,
+) -> None:
+    await asyncio.to_thread(save_check_log, status, offers_count, notified_count, error)
+
+
+async def aget_recent_offers(limit: int = 5) -> list[dict[str, Any]]:
+    return await asyncio.to_thread(get_recent_offers, limit)
+
+
+async def aget_last_check() -> dict[str, Any] | None:
+    return await asyncio.to_thread(get_last_check)
+
+
+async def aget_private_user_ids() -> list[int]:
+    return await asyncio.to_thread(get_private_user_ids)
+
+
+async def aget_subscribers_page(
+    limit: int = 10,
+    offset: int = 0,
+) -> tuple[list[dict[str, Any]], int]:
+    return await asyncio.to_thread(get_subscribers_page, limit, offset)
+
+
+async def aget_user_stats() -> dict[str, Any]:
+    return await asyncio.to_thread(get_user_stats)

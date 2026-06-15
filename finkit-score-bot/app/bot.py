@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from datetime import datetime
+from datetime import timezone
 from typing import Any
 
 from app import storage
@@ -74,9 +75,9 @@ def create_dispatcher() -> Any:
             return
 
         user_id = message.from_user.id if message.from_user else 0
-        search_was_running = storage.pause_user_search(user_id)
+        search_was_running = await storage.apause_user_search(user_id)
         settings = get_settings()
-        filters = _resolved_filters(user_id, settings)
+        filters = await _resolved_filters(user_id, settings)
         await message.answer(
             _build_welcome_text(
                 settings=settings,
@@ -99,10 +100,18 @@ def create_dispatcher() -> Any:
 
         settings = get_settings()
         user_id = message.from_user.id if message.from_user else 0
-        filters = _resolved_filters(user_id, settings)
-        subscriber = storage.get_subscriber(user_id)
+        filters, subscriber = await asyncio.gather(
+            _resolved_filters(user_id, settings),
+            storage.aget_subscriber(user_id),
+        )
         await message.answer(
-            _build_settings_text(settings=settings, filters=filters, subscriber=subscriber),
+            _build_settings_text(
+                settings=settings,
+                filters=filters,
+                subscriber=subscriber,
+                is_trial_running=_subscriber_trial_is_running(subscriber),
+                is_trial_active=_subscriber_trial_is_active(subscriber),
+            ),
             reply_markup=_build_settings_keyboard(
                 InlineKeyboardMarkup,
                 InlineKeyboardButton,
@@ -117,11 +126,11 @@ def create_dispatcher() -> Any:
         if user is None or not is_explicitly_allowed_user(user.id):
             return
         if not _is_private_chat(message):
-            await message.answer("Админка доступна только в личных сообщениях с ботом.")
+            await message.answer("🔒 Админка доступна только в личных сообщениях.")
             return
 
         await message.answer(
-            _build_admin_home_text(),
+            await _build_admin_home_text(),
             reply_markup=_build_admin_keyboard(InlineKeyboardMarkup, InlineKeyboardButton),
         )
 
@@ -145,7 +154,7 @@ def create_dispatcher() -> Any:
             await state.clear()
             await _edit_message_text(
                 message,
-                text=_build_admin_home_text(),
+                text=await _build_admin_home_text(),
                 reply_markup=_build_admin_keyboard(InlineKeyboardMarkup, InlineKeyboardButton),
             )
             await callback.answer()
@@ -153,20 +162,21 @@ def create_dispatcher() -> Any:
 
         if data == f"{ADMIN_CALLBACK_PREFIX}stats":
             await state.clear()
+            stats = await storage.aget_user_stats()
             await _edit_message_text(
                 message,
-                text=_build_admin_stats_text(storage.get_user_stats()),
+                text=_build_admin_stats_text(stats),
                 reply_markup=_build_admin_back_keyboard(
                     InlineKeyboardMarkup,
                     InlineKeyboardButton,
                 ),
             )
-            await callback.answer("Статистика обновлена")
+            await callback.answer("📊 Обновлено")
             return
 
         if data == f"{ADMIN_CALLBACK_PREFIX}users":
             await state.clear()
-            current_page, total_pages, text, reply_markup = _build_admin_users_page(
+            current_page, total_pages, text, reply_markup = await _build_admin_users_page(
                 InlineKeyboardMarkup,
                 InlineKeyboardButton,
                 page_index=0,
@@ -181,10 +191,10 @@ def create_dispatcher() -> Any:
             try:
                 page_index = int(raw_page_index)
             except ValueError:
-                await callback.answer("Не удалось открыть страницу.", show_alert=True)
+                await callback.answer("⚠️ Не удалось открыть страницу.", show_alert=True)
                 return
 
-            current_page, total_pages, text, reply_markup = _build_admin_users_page(
+            current_page, total_pages, text, reply_markup = await _build_admin_users_page(
                 InlineKeyboardMarkup,
                 InlineKeyboardButton,
                 page_index=page_index,
@@ -196,9 +206,10 @@ def create_dispatcher() -> Any:
         if data == f"{ADMIN_CALLBACK_PREFIX}broadcast_all":
             await state.clear()
             await state.set_state(AdminInputState.waiting_broadcast_all_message)
+            user_ids = await storage.aget_private_user_ids()
             await _edit_message_text(
                 message,
-                text=_build_admin_broadcast_all_prompt(len(storage.get_private_user_ids())),
+                text=_build_admin_broadcast_all_prompt(len(user_ids)),
                 reply_markup=_build_admin_cancel_keyboard(
                     InlineKeyboardMarkup,
                     InlineKeyboardButton,
@@ -213,8 +224,8 @@ def create_dispatcher() -> Any:
             await _edit_message_text(
                 message,
                 text=(
-                    "Введите Telegram ID пользователя, которому нужно отправить сообщение.\n\n"
-                    "После этого бот попросит переслать сам текст или медиа."
+                    "👤 Введите Telegram ID пользователя.\n\n"
+                    "После этого я попрошу переслать текст или медиа для отправки."
                 ),
                 reply_markup=_build_admin_cancel_keyboard(
                     InlineKeyboardMarkup,
@@ -239,7 +250,7 @@ def create_dispatcher() -> Any:
             await state.clear()
             return
         if not _is_private_chat(message):
-            await message.answer("Админка доступна только в личных сообщениях с ботом.")
+            await message.answer("🔒 Админка доступна только в личных сообщениях.")
             return
 
         raw_value = (message.text or "").strip()
@@ -247,7 +258,7 @@ def create_dispatcher() -> Any:
             target_user_id = int(raw_value)
         except ValueError:
             await message.answer(
-                "Нужен числовой Telegram ID. Пример: `123456789`.",
+                "⚠️ Нужен числовой Telegram ID. Пример: `123456789`.",
                 reply_markup=_build_admin_cancel_keyboard(
                     InlineKeyboardMarkup,
                     InlineKeyboardButton,
@@ -258,7 +269,7 @@ def create_dispatcher() -> Any:
         await state.update_data(admin_target_user_id=target_user_id)
         await state.set_state(AdminInputState.waiting_broadcast_target_message)
 
-        subscriber = storage.get_subscriber(target_user_id)
+        subscriber = await storage.aget_subscriber(target_user_id)
         await message.answer(
             _build_admin_target_prompt(target_user_id, subscriber),
             reply_markup=_build_admin_cancel_keyboard(
@@ -280,14 +291,14 @@ def create_dispatcher() -> Any:
             await state.clear()
             return
         if not _is_private_chat(message):
-            await message.answer("Админка доступна только в личных сообщениях с ботом.")
+            await message.answer("🔒 Админка доступна только в личных сообщениях.")
             return
 
-        user_ids = storage.get_private_user_ids()
+        user_ids = await storage.aget_private_user_ids()
         if not user_ids:
             await state.clear()
             await message.answer(
-                "В базе пока нет пользователей для рассылки.",
+                "📭 В базе пока нет пользователей для рассылки.",
                 reply_markup=_build_admin_keyboard(InlineKeyboardMarkup, InlineKeyboardButton),
             )
             return
@@ -316,7 +327,7 @@ def create_dispatcher() -> Any:
             await state.clear()
             return
         if not _is_private_chat(message):
-            await message.answer("Админка доступна только в личных сообщениях с ботом.")
+            await message.answer("🔒 Админка доступна только в личных сообщениях.")
             return
 
         state_data = await state.get_data()
@@ -324,7 +335,7 @@ def create_dispatcher() -> Any:
         if not isinstance(target_user_id, int):
             await state.clear()
             await message.answer(
-                "Не удалось определить пользователя. Откройте /admin и повторите отправку.",
+                "⚠️ Не удалось определить пользователя. Откройте /admin и повторите отправку.",
                 reply_markup=_build_admin_keyboard(InlineKeyboardMarkup, InlineKeyboardButton),
             )
             return
@@ -357,7 +368,7 @@ def create_dispatcher() -> Any:
             return
 
         settings = get_settings()
-        filters = _resolved_filters(user.id, settings)
+        filters = await _resolved_filters(user.id, settings)
         await state.set_state(FilterInputState.waiting_for_value)
         prompt_message = await message.answer(_filter_prompt_text(field_key, filters))
         await state.update_data(
@@ -383,7 +394,7 @@ def create_dispatcher() -> Any:
         settings = get_settings()
         user = message.from_user
         user_id = user.id if user else 0
-        current_filters = _resolved_filters(user_id, settings)
+        current_filters = await _resolved_filters(user_id, settings)
         try:
             value = validate_filter_value(field_key, message.text or "", current_filters)
         except ValueError as exc:
@@ -396,7 +407,7 @@ def create_dispatcher() -> Any:
             )
             return
 
-        storage.set_user_filter(
+        await storage.aset_user_filter(
             user_id=user_id,
             chat_id=user_id,
             key=field_key,
@@ -407,32 +418,44 @@ def create_dispatcher() -> Any:
         await _delete_prompt_message(message, state_data)
         await state.clear()
 
-        filters = _resolved_filters(user_id, settings)
-        subscriber = storage.get_subscriber(user_id)
-        lines = [f"{filter_field_label(field_key)} сохранено: {format_filter_value(field_key, value)}."]
-        if storage.is_trial_running(user_id):
-            lines.append("Новое значение уже применяется. Запускаю внеочередную проверку.")
+        filters, subscriber = await asyncio.gather(
+            _resolved_filters(user_id, settings),
+            storage.aget_subscriber(user_id),
+        )
+        is_trial_running = _subscriber_trial_is_running(subscriber)
+        is_trial_active = _subscriber_trial_is_active(subscriber)
+        lines = [
+            f"✅ {filter_field_label(field_key)}: {format_filter_value(field_key, value)}."
+        ]
+        if is_trial_running:
+            lines.append("🔄 Новое значение уже применяется. Запускаю внеочередную проверку.")
 
             from app.monitor import check_once
 
             try:
                 offers_count, notified_count = await check_once(bot=message.bot)
                 lines.append(
-                    f"Проверка выполнена: найдено {offers_count}, уведомлений отправлено {notified_count}."
+                    f"📊 Проверка выполнена: найдено {offers_count}, уведомлений отправлено {notified_count}."
                 )
             except Exception as exc:
-                lines.append(f"Настройка сохранена, но проверка завершилась ошибкой: {exc}")
-        elif storage.is_trial_active(user_id):
-            lines.append("Поиск сейчас остановлен. Нажмите «Запустить поиск», чтобы снова его включить.")
+                lines.append(f"⚠️ Настройка сохранена, но проверка завершилась ошибкой: {exc}")
+        elif is_trial_active:
+            lines.append("⏸️ Поиск сейчас остановлен. Нажмите «Запустить поиск», чтобы снова его включить.")
         elif subscriber and subscriber.get("started_at"):
             lines.append(_build_trial_ended_text(settings))
         else:
-            lines.append("Нажмите «Начать работу», чтобы запустить поиск с новыми параметрами.")
+            lines.append("🚀 Нажмите «Запустить поиск», чтобы применить новые параметры.")
 
         await message.answer(
             "\n\n".join(lines)
             + "\n\n"
-            + _build_settings_text(settings=settings, filters=filters, subscriber=subscriber),
+            + _build_settings_text(
+                settings=settings,
+                filters=filters,
+                subscriber=subscriber,
+                is_trial_running=is_trial_running,
+                is_trial_active=is_trial_active,
+            ),
             reply_markup=_build_settings_keyboard(
                 InlineKeyboardMarkup,
                 InlineKeyboardButton,
@@ -453,14 +476,14 @@ def create_dispatcher() -> Any:
 
         await state.clear()
         settings = get_settings()
-        activation = storage.activate_trial(
+        activation = await storage.aactivate_trial(
             user_id=user.id,
             chat_id=user.id,
             username=user.username,
             first_name=user.first_name,
             duration_hours=settings.trial_duration_hours,
         )
-        filters = _resolved_filters(user.id, settings)
+        filters = await _resolved_filters(user.id, settings)
         reply_markup = _build_settings_keyboard(
             InlineKeyboardMarkup,
             InlineKeyboardButton,
@@ -573,40 +596,50 @@ def create_dispatcher() -> Any:
         await state.clear()
 
         settings = get_settings()
-        storage.set_user_filters(
+        await storage.aset_user_filters(
             user_id=user.id,
             chat_id=user.id,
             filters=empty_user_filters(),
             username=user.username,
             first_name=user.first_name,
         )
-        filters = _resolved_filters(user.id, settings)
-        subscriber = storage.get_subscriber(user.id)
-        lines = ["Все фильтры сброшены."]
+        filters, subscriber = await asyncio.gather(
+            _resolved_filters(user.id, settings),
+            storage.aget_subscriber(user.id),
+        )
+        is_trial_running = _subscriber_trial_is_running(subscriber)
+        is_trial_active = _subscriber_trial_is_active(subscriber)
+        lines = ["🧹 Все фильтры сброшены."]
 
-        if storage.is_trial_running(user.id):
-            lines.append("Новые значения уже применяются. Запускаю внеочередную проверку.")
+        if is_trial_running:
+            lines.append("🔄 Новые значения уже применяются. Запускаю внеочередную проверку.")
 
             from app.monitor import check_once
 
             try:
                 offers_count, notified_count = await check_once(bot=message.bot)
                 lines.append(
-                    f"Проверка выполнена: найдено {offers_count}, уведомлений отправлено {notified_count}."
+                    f"📊 Проверка выполнена: найдено {offers_count}, уведомлений отправлено {notified_count}."
                 )
             except Exception as exc:
-                lines.append(f"Фильтры сброшены, но проверка завершилась ошибкой: {exc}")
-        elif storage.is_trial_active(user.id):
-            lines.append("Поиск сейчас остановлен. Нажмите «Запустить поиск», чтобы снова его включить.")
+                lines.append(f"⚠️ Фильтры сброшены, но проверка завершилась ошибкой: {exc}")
+        elif is_trial_active:
+            lines.append("⏸️ Поиск сейчас остановлен. Нажмите «Запустить поиск», чтобы снова его включить.")
         elif subscriber and subscriber.get("started_at"):
             lines.append(_build_trial_ended_text(settings))
         else:
-            lines.append("Нажмите «Начать работу», чтобы запустить поиск с новыми параметрами.")
+            lines.append("🚀 Нажмите «Запустить поиск», чтобы запустить поиск с чистыми параметрами.")
 
         await message.answer(
             "\n\n".join(lines)
             + "\n\n"
-            + _build_settings_text(settings=settings, filters=filters, subscriber=subscriber),
+            + _build_settings_text(
+                settings=settings,
+                filters=filters,
+                subscriber=subscriber,
+                is_trial_running=is_trial_running,
+                is_trial_active=is_trial_active,
+            ),
             reply_markup=_build_settings_keyboard(
                 InlineKeyboardMarkup,
                 InlineKeyboardButton,
@@ -618,20 +651,22 @@ def create_dispatcher() -> Any:
     @router.message(Command("status"))
     async def status(message: Message) -> None:
         settings = get_settings()
-        default_threshold = _default_threshold(settings)
-        last_check = storage.get_last_check()
-        last_check_time = last_check["checked_at"] if last_check else "нет данных"
         user_id = message.from_user.id if message.from_user else 0
         admin_access = is_authorized(user_id=user_id, chat_id=message.chat.id, settings=settings)
-        subscriber = storage.get_subscriber(user_id)
-        filters = _resolved_filters(user_id, settings)
+        subscriber, filters, last_check = await asyncio.gather(
+            storage.aget_subscriber(user_id),
+            _resolved_filters(user_id, settings),
+            storage.aget_last_check(),
+        )
+        last_check_time = _format_datetime(last_check["checked_at"] if last_check else None)
 
         if admin_access:
+            default_threshold = await _default_threshold(settings)
             await message.answer(
-                "Статус: работает\n"
-                f"Порог по умолчанию: {_format_number(default_threshold)}\n"
-                f"Интервал проверки: {settings.check_interval_seconds} сек.\n"
-                f"Последняя проверка: {last_check_time}"
+                "🛠 Бот работает\n"
+                f"🎯 Порог по умолчанию: {_format_number(default_threshold)}\n"
+                f"⏱ Интервал проверки: {settings.check_interval_seconds} сек.\n"
+                f"🕒 Последняя проверка: {last_check_time}"
             )
             return
 
@@ -639,27 +674,30 @@ def create_dispatcher() -> Any:
             await message.answer(_private_only_text())
             return
 
-        if storage.is_trial_running(user_id):
+        is_trial_running = _subscriber_trial_is_running(subscriber)
+        is_trial_active = _subscriber_trial_is_active(subscriber)
+
+        if is_trial_running:
             await message.answer(
-                "Статус: поиск активен\n"
-                f"Ваш скор от: {_format_filter_brief(filters, 'borrower_score_min')}\n"
-                f"Сумма: {_format_filter_range(filters, 'amount_min', 'amount_max')}\n"
-                f"Срок: {_format_filter_range(filters, 'term_min', 'term_max')}\n"
-                f"Проверка запускается каждые {settings.check_interval_seconds} сек.\n"
-                f"Доступ до: {_format_datetime(subscriber.get('expires_at') if subscriber else None)}\n"
-                f"Последняя проверка: {last_check_time}"
+                "🟢 Поиск активен\n"
+                f"🎯 Скор от: {_format_filter_brief(filters, 'borrower_score_min')}\n"
+                f"💰 Сумма: {_format_filter_range(filters, 'amount_min', 'amount_max')}\n"
+                f"📆 Срок: {_format_filter_range(filters, 'term_min', 'term_max')}\n"
+                f"⏱ Проверка каждые {settings.check_interval_seconds} сек.\n"
+                f"⌛ Доступ до: {_format_datetime(subscriber.get('expires_at') if subscriber else None)}\n"
+                f"🕒 Последняя проверка: {last_check_time}"
             )
             return
 
-        if subscriber and subscriber.get("started_at") and storage.is_trial_active(user_id):
+        if subscriber and subscriber.get("started_at") and is_trial_active:
             await message.answer(
-                "Статус: поиск остановлен\n"
-                f"Ваш скор от: {_format_filter_brief(filters, 'borrower_score_min')}\n"
-                f"Сумма: {_format_filter_range(filters, 'amount_min', 'amount_max')}\n"
-                f"Срок: {_format_filter_range(filters, 'term_min', 'term_max')}\n"
-                "Чтобы продолжить, нажмите «Запустить поиск» в /settings.\n"
-                f"Доступ до: {_format_datetime(subscriber.get('expires_at'))}\n"
-                f"Последняя проверка: {last_check_time}"
+                "⏸️ Поиск остановлен\n"
+                f"🎯 Скор от: {_format_filter_brief(filters, 'borrower_score_min')}\n"
+                f"💰 Сумма: {_format_filter_range(filters, 'amount_min', 'amount_max')}\n"
+                f"📆 Срок: {_format_filter_range(filters, 'term_min', 'term_max')}\n"
+                "▶️ Чтобы продолжить, нажмите «Запустить поиск» в /settings.\n"
+                f"⌛ Доступ до: {_format_datetime(subscriber.get('expires_at'))}\n"
+                f"🕒 Последняя проверка: {last_check_time}"
             )
             return
 
@@ -668,8 +706,8 @@ def create_dispatcher() -> Any:
             return
 
         await message.answer(
-            "Поиск еще не запущен.\n"
-            "Откройте /settings, настройте параметры и нажмите «Начать работу»."
+            "🚀 Поиск еще не запущен.\n"
+            "Откройте /settings, настройте фильтры и нажмите «Запустить поиск»."
         )
 
     @router.message(Command("threshold"))
@@ -682,17 +720,17 @@ def create_dispatcher() -> Any:
         try:
             value = float(raw_value)
         except ValueError:
-            await message.answer("Значение порога должно быть числом.")
+            await message.answer("⚠️ Значение порога должно быть числом.")
             return
 
         if value < 0 or value > 100:
-            await message.answer("Порог должен быть в диапазоне 0 <= threshold <= 100.")
+            await message.answer("⚠️ Порог должен быть в диапазоне 0 <= threshold <= 100.")
             return
 
-        storage.set_threshold(value)
+        await storage.aset_threshold(value)
         await message.answer(
-            f"Порог по умолчанию изменен на {_format_number(value)}.\n"
-            "Запускаю повторную проверку для активных пользователей."
+            f"🎯 Порог по умолчанию изменен на {_format_number(value)}.\n"
+            "🔄 Запускаю повторную проверку для активных пользователей."
         )
 
         from app.monitor import check_after_threshold_change
@@ -700,13 +738,13 @@ def create_dispatcher() -> Any:
         try:
             offers_count, notified_count = await check_after_threshold_change(bot=message.bot)
         except Exception as exc:
-            await message.answer(f"Порог сохранен, но проверка завершилась ошибкой: {exc}")
+            await message.answer(f"⚠️ Порог сохранен, но проверка завершилась ошибкой: {exc}")
             return
 
         await message.answer(
-            "Проверка по новому порогу выполнена.\n"
-            f"Найдено предложений: {offers_count}\n"
-            f"Уведомлений отправлено: {notified_count}"
+            "✅ Проверка по новому порогу выполнена.\n"
+            f"📊 Найдено предложений: {offers_count}\n"
+            f"📬 Уведомлений отправлено: {notified_count}"
         )
 
     @router.message(Command("check"))
@@ -720,13 +758,13 @@ def create_dispatcher() -> Any:
         try:
             offers_count, notified_count = await check_once(bot=message.bot)
         except Exception as exc:
-            await message.answer(f"Проверка завершилась ошибкой: {exc}")
+            await message.answer(f"⚠️ Проверка завершилась ошибкой: {exc}")
             return
 
         await message.answer(
-            "Проверка выполнена.\n"
-            f"Найдено предложений: {offers_count}\n"
-            f"Уведомлений отправлено: {notified_count}"
+            "✅ Проверка выполнена.\n"
+            f"📊 Найдено предложений: {offers_count}\n"
+            f"📬 Уведомлений отправлено: {notified_count}"
         )
 
     @router.message(Command("last"))
@@ -734,20 +772,20 @@ def create_dispatcher() -> Any:
         if not await _ensure_user_access(message):
             return
 
-        offers = storage.get_recent_offers(limit=5)
+        offers = await storage.aget_recent_offers(limit=5)
         if not offers:
-            await message.answer("Сохраненных предложений пока нет.")
+            await message.answer("📭 Сохраненных предложений пока нет.")
             return
 
-        lines = ["Последние сохраненные предложения:"]
+        lines = ["🧾 Последние сохраненные предложения:"]
         for offer in offers:
             lines.append(
                 "\n"
                 f"ID: {offer['offer_id']}\n"
-                f"Скор балл: {_format_number(offer['score'])}\n"
-                f"Первое появление: {offer['first_seen_at']}\n"
-                f"Уведомление: {offer['notified_at'] or '-'}\n"
-                f"Ссылка: {offer['url'] or '-'}"
+                f"🎯 Скор балл: {_format_number(offer['score'])}\n"
+                f"🕒 Первое появление: {offer['first_seen_at']}\n"
+                f"📬 Уведомление: {offer['notified_at'] or '-'}\n"
+                f"🔗 Ссылка: {offer['url'] or '-'}"
             )
         await message.answer("\n".join(lines), disable_web_page_preview=True)
 
@@ -771,7 +809,7 @@ def create_dispatcher() -> Any:
 
         settings = get_settings()
         lines = [
-            "Команды:",
+            "📚 Команды:",
             "/start - главное меню и остановка поиска",
             "/settings - настроить фильтры и запустить поиск",
             "/status - статус поиска и срока доступа",
@@ -789,7 +827,7 @@ def create_dispatcher() -> Any:
             )
         else:
             lines.append(
-                f"После активации бесплатный доступ работает {settings.trial_duration_hours} часа(ов)."
+                f"🎁 После активации бесплатный доступ работает {settings.trial_duration_hours} часа(ов)."
             )
         await message.answer("\n".join(lines))
 
@@ -907,19 +945,39 @@ def _build_admin_cancel_keyboard(markup_cls: Any, button_cls: Any) -> Any:
     )
 
 
-def _build_admin_users_page(markup_cls: Any, button_cls: Any, *, page_index: int) -> tuple[int, int, str, Any]:
-    users, total_count = storage.get_subscribers_page(
+async def _build_admin_users_page(
+    markup_cls: Any,
+    button_cls: Any,
+    *,
+    page_index: int,
+) -> tuple[int, int, str, Any]:
+    users, total_count = await storage.aget_subscribers_page(
         limit=ADMIN_USERS_PAGE_SIZE,
         offset=max(0, page_index) * ADMIN_USERS_PAGE_SIZE,
     )
     total_pages = max(1, (total_count + ADMIN_USERS_PAGE_SIZE - 1) // ADMIN_USERS_PAGE_SIZE)
     safe_page_index = min(max(0, page_index), total_pages - 1)
     if safe_page_index != max(0, page_index):
-        users, total_count = storage.get_subscribers_page(
+        users, total_count = await storage.aget_subscribers_page(
             limit=ADMIN_USERS_PAGE_SIZE,
             offset=safe_page_index * ADMIN_USERS_PAGE_SIZE,
         )
-    text = _build_admin_users_text(users, total_count=total_count, page_index=safe_page_index)
+
+    settings = get_settings()
+    default_threshold = await _default_threshold(settings)
+    raw_filters_list = await asyncio.gather(
+        *(storage.aget_user_filters(int(user["user_id"])) for user in users)
+    ) if users else []
+    filters_by_user = {
+        int(user["user_id"]): resolved_user_filters(raw_filters, default_threshold)
+        for user, raw_filters in zip(users, raw_filters_list, strict=False)
+    }
+    text = _build_admin_users_text(
+        users,
+        filters_by_user=filters_by_user,
+        total_count=total_count,
+        page_index=safe_page_index,
+    )
     reply_markup = _build_admin_users_keyboard(
         markup_cls,
         button_cls,
@@ -963,53 +1021,55 @@ def _build_admin_users_keyboard(
     return markup_cls(inline_keyboard=rows)
 
 
-def _build_admin_home_text() -> str:
-    stats = storage.get_user_stats()
-    last_check = storage.get_last_check()
+async def _build_admin_home_text() -> str:
+    stats, last_check = await asyncio.gather(
+        storage.aget_user_stats(),
+        storage.aget_last_check(),
+    )
     last_check_time = last_check["checked_at"] if last_check else None
     return (
-        "Админка FinKit Score Bot\n\n"
-        f"Пользователей в базе: {_safe_int(stats.get('total_users'))}\n"
-        f"Поиск активен: {_safe_int(stats.get('running_users'))}\n"
-        f"На паузе: {_safe_int(stats.get('paused_users'))}\n"
-        f"Пробный период завершен: {_safe_int(stats.get('expired_users'))}\n"
-        f"Последняя проверка: {_format_datetime(last_check_time)}\n\n"
-        "Выберите действие."
+        "🛠 Админка FinKit Score Bot\n\n"
+        f"👥 Пользователей в базе: {_safe_int(stats.get('total_users'))}\n"
+        f"🟢 Поиск активен: {_safe_int(stats.get('running_users'))}\n"
+        f"⏸️ На паузе: {_safe_int(stats.get('paused_users'))}\n"
+        f"⌛ Период завершен: {_safe_int(stats.get('expired_users'))}\n"
+        f"🕒 Последняя проверка: {_format_datetime(last_check_time)}\n\n"
+        "Выберите действие ниже."
     )
 
 
 def _build_admin_stats_text(stats: dict[str, Any]) -> str:
     return (
-        "Статистика пользователей\n\n"
-        f"За 24 часа: {_safe_int(stats.get('registrations_day'))}\n"
-        f"За 7 дней: {_safe_int(stats.get('registrations_week'))}\n"
-        f"За 30 дней: {_safe_int(stats.get('registrations_month'))}\n"
-        f"За все время: {_safe_int(stats.get('total_users'))}\n\n"
-        f"С фильтрами: {_safe_int(stats.get('configured_users'))}\n"
-        f"Запускали поиск: {_safe_int(stats.get('activated_users'))}\n"
-        f"Активных сейчас: {_safe_int(stats.get('active_users'))}\n"
-        f"Поиск включен: {_safe_int(stats.get('running_users'))}\n"
-        f"Поиск остановлен: {_safe_int(stats.get('paused_users'))}\n"
-        f"Пробный период завершен: {_safe_int(stats.get('expired_users'))}\n\n"
-        f"Последняя регистрация: {_format_datetime(stats.get('last_registration_at'))}\n"
-        f"Последний запуск поиска: {_format_datetime(stats.get('last_activation_at'))}"
+        "📊 Статистика пользователей\n\n"
+        f"🗓 За 24 часа: {_safe_int(stats.get('registrations_day'))}\n"
+        f"📅 За 7 дней: {_safe_int(stats.get('registrations_week'))}\n"
+        f"🗓 За 30 дней: {_safe_int(stats.get('registrations_month'))}\n"
+        f"👥 За все время: {_safe_int(stats.get('total_users'))}\n\n"
+        f"⚙️ С фильтрами: {_safe_int(stats.get('configured_users'))}\n"
+        f"🚀 Запускали поиск: {_safe_int(stats.get('activated_users'))}\n"
+        f"🟢 Активных сейчас: {_safe_int(stats.get('active_users'))}\n"
+        f"🔔 Поиск включен: {_safe_int(stats.get('running_users'))}\n"
+        f"⏸️ Поиск остановлен: {_safe_int(stats.get('paused_users'))}\n"
+        f"⌛ Период завершен: {_safe_int(stats.get('expired_users'))}\n\n"
+        f"🆕 Последняя регистрация: {_format_datetime(stats.get('last_registration_at'))}\n"
+        f"🕒 Последний запуск: {_format_datetime(stats.get('last_activation_at'))}"
     )
 
 
 def _build_admin_users_text(
     users: list[dict[str, Any]],
     *,
+    filters_by_user: dict[int, dict[str, Any]],
     total_count: int,
     page_index: int,
 ) -> str:
     total_pages = max(1, (total_count + ADMIN_USERS_PAGE_SIZE - 1) // ADMIN_USERS_PAGE_SIZE)
     if not users:
-        return "Пользователей в базе пока нет."
+        return "📭 Пользователей в базе пока нет."
 
-    settings = get_settings()
     lines = [
-        f"Пользователи в базе: {total_count}",
-        f"Страница {page_index + 1} из {total_pages}",
+        f"👥 Пользователи в базе: {total_count}",
+        f"📄 Страница {page_index + 1} из {total_pages}",
         "",
     ]
 
@@ -1018,22 +1078,22 @@ def _build_admin_users_text(
         user_id = int(user["user_id"])
         username = user.get("username")
         first_name = user.get("first_name") or "-"
-        filters = _resolved_filters(user_id, settings)
+        filters = filters_by_user.get(user_id, {})
         lines.extend(
             [
-                f"{number}. ID {user_id} | {_format_username(username)} | {first_name}",
+                f"{number}. 👤 ID {user_id} | {_format_username(username)} | {first_name}",
                 (
-                    f"В базе с: {_format_datetime(user.get('created_at'))}"
-                    f" | Старт: {_format_datetime(user.get('started_at'))}"
+                    f"🗂 В базе с: {_format_datetime(user.get('created_at'))}"
+                    f" | 🚀 Старт: {_format_datetime(user.get('started_at'))}"
                 ),
                 (
-                    f"Статус: {_admin_user_status_text(user)}"
-                    f" | До: {_format_datetime(user.get('expires_at'))}"
+                    f"📌 Статус: {_admin_user_status_text(user)}"
+                    f" | ⌛ До: {_format_datetime(user.get('expires_at'))}"
                 ),
                 (
-                    "Фильтры: "
+                    "⚙️ Фильтры: "
                     f"{_compact_filters_text(filters)}"
-                    f" | Финал: {_format_datetime(user.get('trial_ended_notified_at'))}"
+                    f" | 🔚 Финал: {_format_datetime(user.get('trial_ended_notified_at'))}"
                 ),
                 "",
             ]
@@ -1044,26 +1104,26 @@ def _build_admin_users_text(
 
 def _build_admin_broadcast_all_prompt(recipients_count: int) -> str:
     return (
-        "Рассылка всем пользователям\n\n"
-        f"Получателей в базе: {recipients_count}\n\n"
-        "Отправьте одним сообщением текст, фото, видео или другой контент, который нужно разослать."
+        "📢 Рассылка всем пользователям\n\n"
+        f"👥 Получателей в базе: {recipients_count}\n\n"
+        "Отправьте одним сообщением текст, фото, видео или другой контент для рассылки."
     )
 
 
 def _build_admin_target_prompt(target_user_id: int, subscriber: dict[str, Any] | None) -> str:
     if subscriber is None:
         return (
-            f"Пользователь {target_user_id} в базе не найден.\n"
+            f"⚠️ Пользователь {target_user_id} в базе не найден.\n"
             "Если он уже открывал чат с ботом, Telegram все равно может принять отправку.\n\n"
-            "Теперь отправьте сообщение, которое нужно переслать."
+            "Теперь отправьте сообщение для пересылки."
         )
 
     return (
-        f"Получатель: {target_user_id}\n"
-        f"Username: {_format_username(subscriber.get('username'))}\n"
-        f"Имя: {subscriber.get('first_name') or '-'}\n"
-        f"Статус: {_admin_user_status_text(subscriber)}\n\n"
-        "Теперь отправьте сообщение, которое нужно переслать."
+        f"👤 Получатель: {target_user_id}\n"
+        f"🔗 Username: {_format_username(subscriber.get('username'))}\n"
+        f"🪪 Имя: {subscriber.get('first_name') or '-'}\n"
+        f"📌 Статус: {_admin_user_status_text(subscriber)}\n\n"
+        "Теперь отправьте сообщение для пересылки."
     )
 
 
@@ -1074,10 +1134,10 @@ def _build_admin_broadcast_result_text(
     failed_ids: list[int],
 ) -> str:
     lines = [
-        "Рассылка завершена.",
-        f"Получателей: {total_recipients}",
-        f"Успешно: {sent_count}",
-        f"Ошибок: {len(failed_ids)}",
+        "✅ Рассылка завершена.",
+        f"👥 Получателей: {total_recipients}",
+        f"📬 Успешно: {sent_count}",
+        f"⚠️ Ошибок: {len(failed_ids)}",
     ]
     if failed_ids:
         preview = ", ".join(str(user_id) for user_id in failed_ids[:20])
@@ -1093,9 +1153,9 @@ def _build_admin_single_broadcast_result_text(
     failed_ids: list[int],
 ) -> str:
     if sent_count > 0:
-        return f"Сообщение отправлено пользователю {target_user_id}."
+        return f"✅ Сообщение отправлено пользователю {target_user_id}."
     return (
-        f"Не удалось отправить сообщение пользователю {target_user_id}.\n"
+        f"⚠️ Не удалось отправить сообщение пользователю {target_user_id}.\n"
         f"Ошибка по ID: {', '.join(str(user_id) for user_id in failed_ids) or '-'}"
     )
 
@@ -1133,10 +1193,10 @@ def _safe_int(value: object) -> int:
 
 def _admin_user_status_text(user: dict[str, Any]) -> str:
     if not user.get("started_at"):
-        return "не запускал поиск"
-    if _row_trial_is_active(user):
-        return "активен, поиск включен" if _row_search_enabled(user) else "активен, поиск остановлен"
-    return "пробный период завершен"
+        return "не запускал"
+    if _subscriber_trial_is_active(user):
+        return "активен" if _row_search_enabled(user) else "на паузе"
+    return "период завершен"
 
 
 def _row_trial_is_active(user: dict[str, Any]) -> bool:
@@ -1144,7 +1204,7 @@ def _row_trial_is_active(user: dict[str, Any]) -> bool:
     if not expires_at:
         return False
     try:
-        return datetime.fromisoformat(str(expires_at)) > datetime.now().astimezone()
+        return datetime.fromisoformat(str(expires_at)) > datetime.now(timezone.utc)
     except ValueError:
         return False
 
@@ -1159,6 +1219,23 @@ def _row_search_enabled(user: dict[str, Any]) -> bool:
         return bool(value)
 
 
+def _row_is_private_subscriber(user: dict[str, Any] | None) -> bool:
+    if not user:
+        return False
+    try:
+        return int(user.get("chat_id")) == int(user.get("user_id"))
+    except (TypeError, ValueError):
+        return False
+
+
+def _subscriber_trial_is_active(user: dict[str, Any] | None) -> bool:
+    return bool(user) and _row_is_private_subscriber(user) and _row_trial_is_active(user)
+
+
+def _subscriber_trial_is_running(user: dict[str, Any] | None) -> bool:
+    return _subscriber_trial_is_active(user) and _row_search_enabled(user)
+
+
 async def _handle_admin_escape_command(
     message: Any,
     state: Any,
@@ -1171,7 +1248,7 @@ async def _handle_admin_escape_command(
         return False
     await state.clear()
     await message.answer(
-        _build_admin_home_text(),
+        await _build_admin_home_text(),
         reply_markup=_build_admin_keyboard(markup_cls, button_cls),
     )
     return True
@@ -1228,15 +1305,15 @@ def _build_welcome_text(
 ) -> str:
     threshold = filters.get("borrower_score_min")
     text = (
-        "FinKit Score Bot подбирает новые заявки FinKit по вашим фильтрам и отправляет их в ЛС.\n\n"
-        f"Стартовый фильтр: скор {_comparator(settings)} {_format_number(threshold)}.\n"
-        f"Бесплатный доступ: {settings.trial_duration_hours} часа(ов).\n\n"
-        "Ниже компактная панель параметров. Выберите нужное поле и затем запустите поиск."
+        "👋 FinKit Score Bot помогает находить новые заявки FinKit и присылает их в ЛС.\n\n"
+        f"🎯 Стартовый фильтр: скор {_comparator(settings)} {_format_number(threshold)}.\n"
+        f"🎁 Бесплатный доступ: {settings.trial_duration_hours} часа(ов).\n\n"
+        "⚙️ Выберите нужные параметры ниже и запустите поиск."
     )
     if search_was_stopped:
         text = (
-            "Поиск остановлен для этого пользователя.\n"
-            "Чтобы включить его снова, нажмите «Запустить поиск».\n\n"
+            "⏸️ Поиск был остановлен для этого пользователя.\n"
+            "▶️ Чтобы включить его снова, нажмите «Запустить поиск».\n\n"
             + text
         )
     return text
@@ -1247,39 +1324,40 @@ def _build_settings_text(
     settings: Settings,
     filters: dict[str, Any],
     subscriber: dict[str, Any] | None,
+    is_trial_running: bool,
+    is_trial_active: bool,
 ) -> str:
-    user_id = int(subscriber["user_id"]) if subscriber and subscriber.get("user_id") else 0
-    if subscriber and subscriber.get("started_at") and storage.is_trial_running(user_id):
+    if subscriber and subscriber.get("started_at") and is_trial_running:
         status_text = (
-            "Поиск уже активен.\n"
-            f"Доступ до: {_format_datetime(subscriber.get('expires_at'))}\n"
+            "🟢 Поиск активен.\n"
+            f"⌛ Доступ до: {_format_datetime(subscriber.get('expires_at'))}\n"
         )
-    elif subscriber and subscriber.get("started_at") and storage.is_trial_active(user_id):
+    elif subscriber and subscriber.get("started_at") and is_trial_active:
         status_text = (
-            "Поиск остановлен.\n"
-            f"Доступ до: {_format_datetime(subscriber.get('expires_at'))}\n"
-            "Нажмите «Запустить поиск», чтобы снова его включить.\n"
+            "⏸️ Поиск остановлен.\n"
+            f"⌛ Доступ до: {_format_datetime(subscriber.get('expires_at'))}\n"
+            "▶️ Нажмите «Запустить поиск», чтобы снова его включить.\n"
         )
     elif subscriber and subscriber.get("started_at"):
-        status_text = "Бесплатный период уже закончился.\n"
+        status_text = "⌛ Бесплатный период уже закончился.\n"
     else:
-        status_text = "Поиск еще не запущен.\n"
+        status_text = "🚀 Поиск еще не запущен.\n"
 
     return (
-        "Настройки поиска\n\n"
+        "⚙️ Настройки поиска\n\n"
         f"{status_text}"
-        "Параметры заявки\n"
-        f"Скор: {_format_filter_range(filters, 'borrower_score_min', 'borrower_score_max')}\n"
-        f"Сумма: {_format_filter_range(filters, 'amount_min', 'amount_max')}\n"
-        f"Срок: {_format_filter_range(filters, 'term_min', 'term_max')}\n"
-        f"Ставка: {_format_filter_range(filters, 'interest_rate_min', 'interest_rate_max')}\n"
-        f"Рейтинг: {_format_filter_range(filters, 'borrower_rating_min', 'borrower_rating_max')}\n"
-        f"Инвест: {_format_filter_range(filters, 'invest_min', 'invest_max')}\n\n"
-        "Профиль заемщика\n"
-        f"Доход подтвержден: {_format_filter_brief(filters, 'borrower_income_confirmed')}\n"
-        f"Исп. пр-ва: {_format_filter_brief(filters, 'borrower_enforcement_up_to_1_month_absent')}\n"
-        f"Возраст: {_format_filter_brief(filters, 'borrower_age_group')}\n\n"
-        "Кнопки ниже можно менять в любом порядке."
+        "📌 Параметры заявки\n"
+        f"🎯 Скор: {_format_filter_range(filters, 'borrower_score_min', 'borrower_score_max')}\n"
+        f"💰 Сумма: {_format_filter_range(filters, 'amount_min', 'amount_max')}\n"
+        f"📆 Срок: {_format_filter_range(filters, 'term_min', 'term_max')}\n"
+        f"📈 Ставка: {_format_filter_range(filters, 'interest_rate_min', 'interest_rate_max')}\n"
+        f"🏷️ Рейтинг: {_format_filter_range(filters, 'borrower_rating_min', 'borrower_rating_max')}\n"
+        f"💼 Инвест: {_format_filter_range(filters, 'invest_min', 'invest_max')}\n\n"
+        "👤 Профиль заемщика\n"
+        f"💳 Доход подтвержден: {_format_filter_brief(filters, 'borrower_income_confirmed')}\n"
+        f"📄 Исп. пр-ва: {_format_filter_brief(filters, 'borrower_enforcement_up_to_1_month_absent')}\n"
+        f"🪪 Возраст: {_format_filter_brief(filters, 'borrower_age_group')}\n\n"
+        "Ниже можно менять параметры в любом порядке."
     )
 
 
@@ -1291,16 +1369,16 @@ def _build_active_trial_text(
     just_started: bool,
 ) -> str:
     expires_at = subscriber.get("expires_at") if subscriber else None
-    intro = "Поиск запущен." if just_started else "Поиск уже активен."
+    intro = "✅ Поиск запущен." if just_started else "🟢 Поиск уже активен."
     return (
         f"{intro}\n\n"
-        f"Проверка каждые {settings.check_interval_seconds} сек.\n"
-        f"Скор: {_format_filter_range(filters, 'borrower_score_min', 'borrower_score_max')}\n"
-        f"Сумма: {_format_filter_range(filters, 'amount_min', 'amount_max')}\n"
-        f"Срок: {_format_filter_range(filters, 'term_min', 'term_max')}\n"
-        f"Ставка: {_format_filter_range(filters, 'interest_rate_min', 'interest_rate_max')}\n"
-        "Как только появится подходящее предложение, бот отправит его вам в личные сообщения.\n"
-        f"Доступ действует до: {_format_datetime(expires_at)}"
+        f"⏱ Проверка каждые {settings.check_interval_seconds} сек.\n"
+        f"🎯 Скор: {_format_filter_range(filters, 'borrower_score_min', 'borrower_score_max')}\n"
+        f"💰 Сумма: {_format_filter_range(filters, 'amount_min', 'amount_max')}\n"
+        f"📆 Срок: {_format_filter_range(filters, 'term_min', 'term_max')}\n"
+        f"📈 Ставка: {_format_filter_range(filters, 'interest_rate_min', 'interest_rate_max')}\n"
+        "📬 Как только появится подходящее предложение, я отправлю его в личные сообщения.\n"
+        f"⌛ Доступ действует до: {_format_datetime(expires_at)}"
     )
 
 
@@ -1355,8 +1433,8 @@ async def _delete_prompt_message(message: Any, state_data: dict[str, Any]) -> No
 
 def _build_trial_ended_text(settings: Settings) -> str:
     return (
-        "Бесплатный период закончился.\n\n"
-        f"Чтобы продолжить работу, напишите {settings.trial_manager_contact}."
+        "⌛ Бесплатный период закончился.\n\n"
+        f"💬 Чтобы продолжить работу, напишите {settings.trial_manager_contact}."
     )
 
 
@@ -1367,27 +1445,27 @@ def _build_start_check_result_text(
     notified_count: int,
 ) -> str:
     if notified_count > 0:
-        prefix = "Первая проверка выполнена." if just_started else "Проверка выполнена."
+        prefix = "✅ Первая проверка выполнена." if just_started else "✅ Проверка выполнена."
         if notified_count > 10:
             return (
                 f"{prefix}\n"
-                f"Найдено предложений: {offers_count}\n"
-                f"Подходящих предложений: {notified_count}\n"
-                "Показаны первые 10. Остальные можно открыть кнопками ниже."
+                f"📊 Найдено предложений: {offers_count}\n"
+                f"📬 Подходящих предложений: {notified_count}\n"
+                "📄 Показаны первые 10. Остальные можно открыть кнопками ниже."
             )
         return (
             f"{prefix}\n"
-            f"Найдено предложений: {offers_count}\n"
-            f"Отправлено уведомлений: {notified_count}"
+            f"📊 Найдено предложений: {offers_count}\n"
+            f"📬 Отправлено уведомлений: {notified_count}"
         )
 
     if offers_count <= 0:
-        return "Проверка выполнена, но площадка сейчас не вернула доступных предложений."
+        return "ℹ️ Проверка выполнена, но площадка сейчас не вернула доступных предложений."
 
     return (
-        "Проверка выполнена.\n"
-        f"Найдено предложений: {offers_count}\n"
-        "По вашим фильтрам подходящих предложений сейчас нет."
+        "✅ Проверка выполнена.\n"
+        f"📊 Найдено предложений: {offers_count}\n"
+        "🔎 По вашим фильтрам подходящих предложений сейчас нет."
     )
 
 
@@ -1442,12 +1520,16 @@ def _comparator(settings: Settings) -> str:
     return ">=" if settings.score_compare_mode == "gte" else ">"
 
 
-def _default_threshold(settings: Settings) -> float:
-    return storage.get_threshold(settings.default_score_threshold)
+async def _default_threshold(settings: Settings) -> float:
+    return await storage.aget_threshold(settings.default_score_threshold)
 
 
-def _resolved_filters(user_id: int, settings: Settings) -> dict[str, Any]:
-    return resolved_user_filters(storage.get_user_filters(user_id), _default_threshold(settings))
+async def _resolved_filters(user_id: int, settings: Settings) -> dict[str, Any]:
+    raw_filters, default_threshold = await asyncio.gather(
+        storage.aget_user_filters(user_id),
+        _default_threshold(settings),
+    )
+    return resolved_user_filters(raw_filters, default_threshold)
 
 
 async def _edit_message_text(message: Any, *, text: str, reply_markup: Any | None = None) -> None:
@@ -1476,15 +1558,15 @@ async def _ensure_user_access(message: Any) -> bool:
     user = getattr(message, "from_user", None)
     user_id = user.id if user else 0
 
-    if storage.is_trial_active(user_id):
+    subscriber = await storage.aget_subscriber(user_id)
+    if _subscriber_trial_is_active(subscriber):
         return True
 
-    subscriber = storage.get_subscriber(user_id)
     if subscriber and subscriber.get("started_at"):
         await message.answer(_build_trial_ended_text(get_settings()))
         return False
 
-    await message.answer("Сначала откройте /settings, задайте фильтры и нажмите «Начать работу».")
+    await message.answer("🚀 Сначала откройте /settings, задайте фильтры и нажмите «Запустить поиск».")
     return False
 
 
@@ -1504,4 +1586,4 @@ def _is_private_chat(message: Any) -> bool:
 
 
 def _private_only_text() -> str:
-    return "Эта функция работает только в личных сообщениях с ботом. Напишите боту в ЛС и используйте /start или /settings."
+    return "🔒 Эта функция работает только в личных сообщениях. Напишите боту в ЛС и используйте /start или /settings."

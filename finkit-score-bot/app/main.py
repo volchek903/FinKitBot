@@ -33,7 +33,7 @@ async def monitoring_loop(telegram_bot: object) -> None:
 async def main() -> None:
     setup_logging()
     settings = get_settings()
-    storage.init_db()
+    await storage.ainit_db()
 
     if not settings.telegram_bot_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
