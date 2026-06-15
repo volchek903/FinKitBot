@@ -38,6 +38,8 @@ AUTH_COMPLETION_TIMEOUT_MS = 15_000
 AUTH_POLL_INTERVAL_MS = 500
 KNOWN_OFFERS_API_PATH = "/loans-to-invest/"
 DEFAULT_OFFERS_ORDERING = "-signed_at"
+NAVIGATION_RETRIES = 3
+NAVIGATION_RETRY_DELAY_MS = 3_000
 
 
 async def get_offers() -> list[Offer]:
@@ -45,33 +47,47 @@ async def get_offers() -> list[Offer]:
 
 
 async def get_offers_from_api_or_dom() -> list[Offer]:
+    settings = get_settings()
+    use_storage_state = settings.playwright_state_file.exists()
+    offers, auth_forbidden = await _load_offers_with_browser(use_storage_state=use_storage_state)
+    if offers or not use_storage_state or not auth_forbidden:
+        return offers
+
+    logger.warning("stored playwright session was rejected by FinKit, retrying with a fresh login")
+    _delete_playwright_state_file(settings.playwright_state_file)
+    offers, _ = await _load_offers_with_browser(use_storage_state=False)
+    return offers
+
+
+async def _load_offers_with_browser(*, use_storage_state: bool) -> tuple[list[Offer], bool]:
     from playwright.async_api import async_playwright
 
     settings = get_settings()
     target_url = current_offers_url()
     settings.playwright_state_file.parent.mkdir(parents=True, exist_ok=True)
     context_options: dict[str, Any] = {}
-    if settings.playwright_state_file.exists():
+    if use_storage_state and settings.playwright_state_file.exists():
         context_options["storage_state"] = str(settings.playwright_state_file)
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=settings.playwright_headless)
         context = await browser.new_context(**context_options)
         page = await context.new_page()
+        request_state = {"auth_forbidden": False}
         try:
             await _open_offers_page(page)
             await _login_if_needed(page, context)
 
-            direct_api_offers = await _offers_from_known_api(context, page)
+            direct_api_offers = await _offers_from_known_api(context, page, request_state)
             if direct_api_offers:
                 logger.info("offers source=direct-api offers_count=%s", len(direct_api_offers))
-                return direct_api_offers
+                return direct_api_offers, False
 
             captures = await discover_offers_api(page)
             best_api_offers: list[Offer] = []
             best_api_priority: tuple[int, int, int, int, int] | None = None
             for capture in captures:
-                offers = await _offers_from_capture(context, page, capture)
+                offers = await _offers_from_capture(context, page, capture, request_state)
                 if not offers:
                     continue
                 priority = _capture_priority(capture, target_url)
@@ -81,13 +97,13 @@ async def get_offers_from_api_or_dom() -> list[Offer]:
 
             if best_api_offers:
                 logger.info("offers source=api offers_count=%s", len(best_api_offers))
-                return _dedupe_offers(best_api_offers)
+                return _dedupe_offers(best_api_offers), False
 
             dom_offers = await _collect_offers_from_dom(page)
             if not dom_offers:
                 await _log_empty_offers_page(page)
             logger.info("offers source=dom offers_count=%s", len(dom_offers))
-            return dom_offers
+            return dom_offers, bool(request_state.get("auth_forbidden"))
         finally:
             await context.close()
             await browser.close()
@@ -162,7 +178,9 @@ async def _login_if_needed(page: Any, context: Any) -> None:
         return
 
     await _raise_if_blocked_auth(page)
+    await _dismiss_cookie_banner_if_needed(page)
     await _open_login_form_if_needed(page)
+    await _dismiss_cookie_banner_if_needed(page)
 
     login_input = await _first_visible_locator(
         page,
@@ -188,6 +206,7 @@ async def _login_if_needed(page: Any, context: Any) -> None:
 
     await login_input.fill(settings.finkit_login)
     await password_input.fill(settings.finkit_password)
+    await _dismiss_cookie_banner_if_needed(page)
 
     button = await _first_visible_locator(
         page,
@@ -233,6 +252,25 @@ async def _open_login_form_if_needed(page: Any) -> None:
     if login_button is not None:
         await login_button.click()
         await page.wait_for_timeout(1000)
+
+
+async def _dismiss_cookie_banner_if_needed(page: Any) -> None:
+    button = await _first_clickable_locator(
+        page,
+        [
+            'button:has-text("Понятно")',
+            'button:has-text("Принять")',
+            'button:has-text("Согласен")',
+            'button:has-text("Accept")',
+        ],
+    )
+    if button is None:
+        return
+    try:
+        await button.click()
+        await page.wait_for_timeout(500)
+    except Exception:
+        pass
 
 
 async def _login_appears_required(page: Any) -> bool:
@@ -341,23 +379,37 @@ async def _find_next_button(page: Any) -> Any | None:
     return None
 
 
-async def _offers_from_capture(context: Any, page: Any, capture: dict[str, Any]) -> list[Offer]:
-    payloads = await _collect_paginated_payloads(context, page, capture)
+async def _offers_from_capture(
+    context: Any,
+    page: Any,
+    capture: dict[str, Any],
+    request_state: dict[str, bool],
+) -> list[Offer]:
+    payloads = await _collect_paginated_payloads(context, page, capture, request_state)
     offers: list[Offer] = []
     for payload in payloads:
         offers.extend(parse_offers_from_json(payload))
     return _dedupe_offers(offers)
 
 
-async def _offers_from_known_api(context: Any, page: Any) -> list[Offer]:
-    payloads = await _collect_next_link_payloads(context, page, _known_offers_api_url())
+async def _offers_from_known_api(
+    context: Any,
+    page: Any,
+    request_state: dict[str, bool],
+) -> list[Offer]:
+    payloads = await _collect_next_link_payloads(context, page, _known_offers_api_url(), request_state)
     offers: list[Offer] = []
     for payload in payloads:
         offers.extend(parse_offers_from_json(payload))
     return _dedupe_offers(offers)
 
 
-async def _collect_paginated_payloads(context: Any, page: Any, capture: dict[str, Any]) -> list[Any]:
+async def _collect_paginated_payloads(
+    context: Any,
+    page: Any,
+    capture: dict[str, Any],
+    request_state: dict[str, bool],
+) -> list[Any]:
     first_payload = capture["payload"]
     payloads = [first_payload]
     info = _find_pagination_info(first_payload)
@@ -373,7 +425,7 @@ async def _collect_paginated_payloads(context: Any, page: Any, capture: dict[str
         if key in seen_request_keys:
             break
         seen_request_keys.add(key)
-        payload = await _fetch_json(context, page, "GET", absolute_next)
+        payload = await _fetch_json(context, page, "GET", absolute_next, None, request_state)
         if not payload_looks_like_offers(payload):
             break
         payloads.append(payload)
@@ -385,14 +437,19 @@ async def _collect_paginated_payloads(context: Any, page: Any, capture: dict[str
         if key in seen_request_keys:
             continue
         seen_request_keys.add(key)
-        payload = await _fetch_json(context, page, method, url, post_data)
+        payload = await _fetch_json(context, page, method, url, post_data, request_state)
         if payload_looks_like_offers(payload):
             payloads.append(payload)
 
     return payloads
 
 
-async def _collect_next_link_payloads(context: Any, page: Any, initial_url: str) -> list[Any]:
+async def _collect_next_link_payloads(
+    context: Any,
+    page: Any,
+    initial_url: str,
+    request_state: dict[str, bool],
+) -> list[Any]:
     payloads: list[Any] = []
     seen_urls: set[str] = set()
     next_url: str | None = initial_url
@@ -403,7 +460,7 @@ async def _collect_next_link_payloads(context: Any, page: Any, initial_url: str)
             break
         seen_urls.add(absolute_next)
 
-        payload = await _fetch_json(context, page, "GET", absolute_next)
+        payload = await _fetch_json(context, page, "GET", absolute_next, None, request_state)
         if not payload_looks_like_offers(payload):
             break
         payloads.append(payload)
@@ -421,6 +478,7 @@ async def _fetch_json(
     method: str,
     url: str,
     post_data: str | None = None,
+    request_state: dict[str, bool] | None = None,
 ) -> Any:
     try:
         options: dict[str, Any] = {"method": method.upper(), "timeout": 30_000}
@@ -431,6 +489,8 @@ async def _fetch_json(
         response = await context.request.fetch(url, **options)
         if not response.ok:
             if response.status in {401, 403}:
+                if request_state is not None:
+                    request_state["auth_forbidden"] = True
                 payload = await _fetch_json_via_page(page, method, url, post_data, response.status)
                 if payload is not None:
                     return payload
@@ -769,13 +829,55 @@ async def _auth_session_is_authenticated(context: Any) -> bool:
 
 
 async def _open_offers_page(page: Any) -> None:
-    await page.goto(current_offers_url(), wait_until="commit", timeout=NAVIGATION_TIMEOUT_MS)
+    await _goto_with_retries(page, current_offers_url())
     await _settle_after_navigation(page)
 
 
 async def _reload_offers_page(page: Any) -> None:
-    await page.reload(wait_until="commit", timeout=NAVIGATION_TIMEOUT_MS)
+    await _reload_with_retries(page)
     await _settle_after_navigation(page)
+
+
+async def _goto_with_retries(page: Any, url: str) -> None:
+    last_error: Exception | None = None
+    for attempt in range(1, NAVIGATION_RETRIES + 1):
+        try:
+            await page.goto(url, wait_until="commit", timeout=NAVIGATION_TIMEOUT_MS)
+            return
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "offers page navigation failed attempt=%s/%s url=%s error=%s",
+                attempt,
+                NAVIGATION_RETRIES,
+                url,
+                exc,
+            )
+            if attempt < NAVIGATION_RETRIES:
+                await page.wait_for_timeout(NAVIGATION_RETRY_DELAY_MS)
+    if last_error is not None:
+        raise last_error
+
+
+async def _reload_with_retries(page: Any) -> None:
+    last_error: Exception | None = None
+    for attempt in range(1, NAVIGATION_RETRIES + 1):
+        try:
+            await page.reload(wait_until="commit", timeout=NAVIGATION_TIMEOUT_MS)
+            return
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "offers page reload failed attempt=%s/%s url=%s error=%s",
+                attempt,
+                NAVIGATION_RETRIES,
+                page.url,
+                exc,
+            )
+            if attempt < NAVIGATION_RETRIES:
+                await page.wait_for_timeout(NAVIGATION_RETRY_DELAY_MS)
+    if last_error is not None:
+        raise last_error
 
 
 async def _settle_after_navigation(page: Any) -> None:
@@ -796,6 +898,13 @@ async def _save_storage_state(context: Any) -> None:
     state_path = Path(settings.playwright_state_path)
     state_path.parent.mkdir(parents=True, exist_ok=True)
     await context.storage_state(path=str(state_path))
+
+
+def _delete_playwright_state_file(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        logger.warning("failed to delete playwright state file path=%s", path)
 
 
 async def _log_empty_offers_page(page: Any) -> None:
