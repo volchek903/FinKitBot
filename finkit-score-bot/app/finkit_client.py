@@ -62,7 +62,7 @@ async def get_offers_from_api_or_dom() -> list[Offer]:
             await _open_offers_page(page)
             await _login_if_needed(page, context)
 
-            direct_api_offers = await _offers_from_known_api(context)
+            direct_api_offers = await _offers_from_known_api(context, page)
             if direct_api_offers:
                 logger.info("offers source=direct-api offers_count=%s", len(direct_api_offers))
                 return direct_api_offers
@@ -71,7 +71,7 @@ async def get_offers_from_api_or_dom() -> list[Offer]:
             best_api_offers: list[Offer] = []
             best_api_priority: tuple[int, int, int, int, int] | None = None
             for capture in captures:
-                offers = await _offers_from_capture(context, capture)
+                offers = await _offers_from_capture(context, page, capture)
                 if not offers:
                     continue
                 priority = _capture_priority(capture, target_url)
@@ -341,23 +341,23 @@ async def _find_next_button(page: Any) -> Any | None:
     return None
 
 
-async def _offers_from_capture(context: Any, capture: dict[str, Any]) -> list[Offer]:
-    payloads = await _collect_paginated_payloads(context, capture)
+async def _offers_from_capture(context: Any, page: Any, capture: dict[str, Any]) -> list[Offer]:
+    payloads = await _collect_paginated_payloads(context, page, capture)
     offers: list[Offer] = []
     for payload in payloads:
         offers.extend(parse_offers_from_json(payload))
     return _dedupe_offers(offers)
 
 
-async def _offers_from_known_api(context: Any) -> list[Offer]:
-    payloads = await _collect_next_link_payloads(context, _known_offers_api_url())
+async def _offers_from_known_api(context: Any, page: Any) -> list[Offer]:
+    payloads = await _collect_next_link_payloads(context, page, _known_offers_api_url())
     offers: list[Offer] = []
     for payload in payloads:
         offers.extend(parse_offers_from_json(payload))
     return _dedupe_offers(offers)
 
 
-async def _collect_paginated_payloads(context: Any, capture: dict[str, Any]) -> list[Any]:
+async def _collect_paginated_payloads(context: Any, page: Any, capture: dict[str, Any]) -> list[Any]:
     first_payload = capture["payload"]
     payloads = [first_payload]
     info = _find_pagination_info(first_payload)
@@ -373,7 +373,7 @@ async def _collect_paginated_payloads(context: Any, capture: dict[str, Any]) -> 
         if key in seen_request_keys:
             break
         seen_request_keys.add(key)
-        payload = await _fetch_json(context, "GET", absolute_next)
+        payload = await _fetch_json(context, page, "GET", absolute_next)
         if not payload_looks_like_offers(payload):
             break
         payloads.append(payload)
@@ -385,14 +385,14 @@ async def _collect_paginated_payloads(context: Any, capture: dict[str, Any]) -> 
         if key in seen_request_keys:
             continue
         seen_request_keys.add(key)
-        payload = await _fetch_json(context, method, url, post_data)
+        payload = await _fetch_json(context, page, method, url, post_data)
         if payload_looks_like_offers(payload):
             payloads.append(payload)
 
     return payloads
 
 
-async def _collect_next_link_payloads(context: Any, initial_url: str) -> list[Any]:
+async def _collect_next_link_payloads(context: Any, page: Any, initial_url: str) -> list[Any]:
     payloads: list[Any] = []
     seen_urls: set[str] = set()
     next_url: str | None = initial_url
@@ -403,7 +403,7 @@ async def _collect_next_link_payloads(context: Any, initial_url: str) -> list[An
             break
         seen_urls.add(absolute_next)
 
-        payload = await _fetch_json(context, "GET", absolute_next)
+        payload = await _fetch_json(context, page, "GET", absolute_next)
         if not payload_looks_like_offers(payload):
             break
         payloads.append(payload)
@@ -415,7 +415,13 @@ async def _collect_next_link_payloads(context: Any, initial_url: str) -> list[An
     return payloads
 
 
-async def _fetch_json(context: Any, method: str, url: str, post_data: str | None = None) -> Any:
+async def _fetch_json(
+    context: Any,
+    page: Any,
+    method: str,
+    url: str,
+    post_data: str | None = None,
+) -> Any:
     try:
         options: dict[str, Any] = {"method": method.upper(), "timeout": 30_000}
         if post_data and method.upper() != "GET":
@@ -424,12 +430,103 @@ async def _fetch_json(context: Any, method: str, url: str, post_data: str | None
                 options["headers"] = {"content-type": "application/json"}
         response = await context.request.fetch(url, **options)
         if not response.ok:
+            if response.status in {401, 403}:
+                payload = await _fetch_json_via_page(page, method, url, post_data, response.status)
+                if payload is not None:
+                    return payload
             logger.warning("api pagination request failed status=%s url=%s", response.status, url)
             return None
         return await response.json()
     except Exception as exc:
         logger.warning("api pagination request failed url=%s error=%s", url, exc)
+        if page is not None:
+            return await _fetch_json_via_page(page, method, url, post_data, None)
         return None
+
+
+async def _fetch_json_via_page(
+    page: Any,
+    method: str,
+    url: str,
+    post_data: str | None,
+    failed_status: int | None,
+) -> Any:
+    try:
+        response_data = await page.evaluate(
+            """
+            async ({ url, method, body }) => {
+                const headers = { "accept": "application/json, text/plain, */*" };
+                if (body && method !== "GET") {
+                    const trimmed = body.trim();
+                    headers["content-type"] = trimmed.startsWith("{") || trimmed.startsWith("[")
+                        ? "application/json"
+                        : "text/plain;charset=UTF-8";
+                }
+
+                try {
+                    const response = await fetch(url, {
+                        method,
+                        body: body && method !== "GET" ? body : undefined,
+                        credentials: "include",
+                        headers,
+                    });
+                    return {
+                        ok: response.ok,
+                        status: response.status,
+                        text: await response.text(),
+                    };
+                } catch (error) {
+                    return {
+                        ok: false,
+                        status: 0,
+                        error: String(error),
+                        text: "",
+                    };
+                }
+            }
+            """,
+            {"url": url, "method": method.upper(), "body": post_data},
+        )
+    except Exception as exc:
+        logger.warning(
+            "browser-context api retry failed url=%s previous_status=%s error=%s",
+            url,
+            failed_status,
+            exc,
+        )
+        return None
+
+    if not isinstance(response_data, dict):
+        return None
+
+    if not response_data.get("ok"):
+        logger.warning(
+            "browser-context api retry failed status=%s previous_status=%s url=%s error=%s",
+            response_data.get("status"),
+            failed_status,
+            url,
+            response_data.get("error"),
+        )
+        return None
+
+    try:
+        payload = json.loads(response_data.get("text") or "null")
+    except json.JSONDecodeError:
+        logger.warning(
+            "browser-context api retry returned non-json status=%s previous_status=%s url=%s",
+            response_data.get("status"),
+            failed_status,
+            url,
+        )
+        return None
+
+    logger.info(
+        "browser-context api retry succeeded previous_status=%s retry_status=%s url=%s",
+        failed_status,
+        response_data.get("status"),
+        url,
+    )
+    return payload
 
 
 def _build_paginated_requests(
