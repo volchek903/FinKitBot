@@ -1,3 +1,5 @@
+import asyncio
+import logging
 from datetime import datetime
 from typing import Any
 
@@ -27,6 +29,10 @@ FILTER_BUTTON_ROWS: tuple[tuple[str, ...], ...] = (
 ADMIN_CALLBACK_PREFIX = "admin:"
 ADMIN_USERS_PAGE_SIZE = 10
 ADMIN_NOOP_CALLBACK = f"{ADMIN_CALLBACK_PREFIX}noop"
+COMMAND_SYNC_RETRIES = 3
+COMMAND_SYNC_RETRY_DELAY_SECONDS = 2
+
+logger = logging.getLogger(__name__)
 
 
 def is_authorized(user_id: int, chat_id: int, settings: Settings | None = None) -> bool:
@@ -793,6 +799,7 @@ def create_dispatcher() -> Any:
 
 
 async def register_bot_commands(bot: Any) -> None:
+    from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
     from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
 
     user_commands = [
@@ -810,12 +817,54 @@ async def register_bot_commands(bot: Any) -> None:
         BotCommand(command="chat_id", description="Показать chat ID"),
     ]
 
-    await bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
+    async def set_commands_with_retry(commands: list[Any], *, scope: Any, scope_name: str) -> bool:
+        retry_delay = COMMAND_SYNC_RETRY_DELAY_SECONDS
+        for attempt in range(1, COMMAND_SYNC_RETRIES + 1):
+            try:
+                await bot.set_my_commands(commands, scope=scope)
+                return True
+            except TelegramRetryAfter as exc:
+                logger.warning(
+                    "telegram flood control while registering bot commands scope=%s retry_after=%s",
+                    scope_name,
+                    exc.retry_after,
+                )
+                await asyncio.sleep(exc.retry_after)
+            except TelegramNetworkError as exc:
+                if attempt >= COMMAND_SYNC_RETRIES:
+                    logger.warning(
+                        "failed to register bot commands after %s attempts scope=%s error=%s",
+                        attempt,
+                        scope_name,
+                        exc,
+                    )
+                    return False
+                logger.warning(
+                    "telegram network error while registering bot commands attempt=%s/%s scope=%s retry_in=%ss error=%s",
+                    attempt,
+                    COMMAND_SYNC_RETRIES,
+                    scope_name,
+                    retry_delay,
+                    exc,
+                )
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(30, retry_delay * 2)
+            except Exception:
+                logger.exception("unexpected error while registering bot commands scope=%s", scope_name)
+                return False
+        return False
+
+    await set_commands_with_retry(
+        user_commands,
+        scope=BotCommandScopeDefault(),
+        scope_name="default",
+    )
 
     for admin_user_id in get_settings().telegram_allowed_user_ids:
-        await bot.set_my_commands(
+        await set_commands_with_retry(
             admin_commands,
             scope=BotCommandScopeChat(chat_id=int(admin_user_id)),
+            scope_name=f"chat:{int(admin_user_id)}",
         )
 
 
