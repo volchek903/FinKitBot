@@ -1,5 +1,12 @@
 .env
 data/*.sqlite3
+data/*.sqlite3-*
+data/*.db
+data/*.db-*
+data/*.sqlite
+data/*.sqlite-*
+data/*.db-journal
+data/*.sqlite-journal
 data/*.json
 __pycache__/
 *.pyc

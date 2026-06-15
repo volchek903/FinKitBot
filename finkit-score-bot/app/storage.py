@@ -1,10 +1,12 @@
 import sqlite3
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 from typing import Any
 
 from app.config import get_settings
 from app.models import Offer
+from app.user_filters import empty_user_filters
 
 
 def init_db() -> None:
@@ -40,7 +42,10 @@ def init_db() -> None:
                 chat_id INTEGER NOT NULL,
                 username TEXT,
                 first_name TEXT,
+                created_at TEXT,
                 score_threshold REAL,
+                filters_json TEXT,
+                search_enabled INTEGER,
                 started_at TEXT,
                 expires_at TEXT,
                 trial_ended_notified_at TEXT
@@ -55,6 +60,17 @@ def init_db() -> None:
             """
         )
         _ensure_column(conn, "subscribers", "score_threshold", "REAL")
+        _ensure_column(conn, "subscribers", "filters_json", "TEXT")
+        _ensure_column(conn, "subscribers", "search_enabled", "INTEGER")
+        _ensure_column(conn, "subscribers", "created_at", "TEXT")
+        conn.execute(
+            """
+            UPDATE subscribers
+            SET created_at = COALESCE(created_at, started_at, expires_at, trial_ended_notified_at, ?)
+            WHERE created_at IS NULL
+            """,
+            (_now(),),
+        )
 
 
 def is_seen(offer_id: str) -> bool:
@@ -84,8 +100,11 @@ def save_seen(offer: Offer) -> None:
     with _connect() as conn:
         conn.execute(
             """
-            INSERT OR IGNORE INTO offers_seen (offer_id, score, url, first_seen_at)
+            INSERT INTO offers_seen (offer_id, score, url, first_seen_at)
             VALUES (?, ?, ?, ?)
+            ON CONFLICT(offer_id) DO UPDATE SET
+                score = excluded.score,
+                url = excluded.url
             """,
             (offer.id, offer.score, offer.url, _now()),
         )
@@ -108,7 +127,10 @@ def get_subscriber(user_id: int) -> dict[str, Any] | None:
                 chat_id,
                 username,
                 first_name,
+                created_at,
                 score_threshold,
+                filters_json,
+                search_enabled,
                 started_at,
                 expires_at,
                 trial_ended_notified_at
@@ -132,6 +154,7 @@ def activate_trial(
     current = get_subscriber(user_id)
 
     if current and current.get("started_at"):
+        set_user_search_enabled(user_id, enabled=True)
         _upsert_subscriber_identity(user_id, chat_id, username, first_name)
         refreshed = get_subscriber(user_id) or current
         if _is_trial_active_row(refreshed, now=now):
@@ -144,17 +167,27 @@ def activate_trial(
         conn.execute(
             """
             INSERT INTO subscribers (
-                user_id, chat_id, username, first_name, started_at, expires_at, trial_ended_notified_at
+                user_id,
+                chat_id,
+                username,
+                first_name,
+                created_at,
+                search_enabled,
+                started_at,
+                expires_at,
+                trial_ended_notified_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, NULL)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?, NULL)
             ON CONFLICT(user_id) DO UPDATE SET
                 chat_id = excluded.chat_id,
                 username = excluded.username,
                 first_name = excluded.first_name,
+                created_at = COALESCE(subscribers.created_at, excluded.created_at),
+                search_enabled = 1,
                 started_at = COALESCE(subscribers.started_at, excluded.started_at),
                 expires_at = COALESCE(subscribers.expires_at, excluded.expires_at)
             """,
-            (user_id, chat_id, username, first_name, started_at, expires_at),
+            (user_id, chat_id, username, first_name, started_at, started_at, expires_at),
         )
 
     subscriber = get_subscriber(user_id)
@@ -171,7 +204,10 @@ def get_active_subscribers() -> list[dict[str, Any]]:
                 chat_id,
                 username,
                 first_name,
+                created_at,
                 score_threshold,
+                filters_json,
+                search_enabled,
                 started_at,
                 expires_at,
                 trial_ended_notified_at
@@ -179,6 +215,7 @@ def get_active_subscribers() -> list[dict[str, Any]]:
             WHERE started_at IS NOT NULL
               AND expires_at IS NOT NULL
               AND chat_id = user_id
+              AND COALESCE(search_enabled, 1) = 1
               AND expires_at > ?
             ORDER BY started_at ASC
             """,
@@ -197,7 +234,10 @@ def get_expired_subscribers_pending_notice() -> list[dict[str, Any]]:
                 chat_id,
                 username,
                 first_name,
+                created_at,
                 score_threshold,
+                filters_json,
+                search_enabled,
                 started_at,
                 expires_at,
                 trial_ended_notified_at
@@ -253,6 +293,40 @@ def mark_user_offer_notified(user_id: int, offer_id: str) -> None:
         )
 
 
+def forget_missing_offers(current_offer_ids: set[str]) -> int:
+    with _connect() as conn:
+        if current_offer_ids:
+            placeholders = ", ".join("?" for _ in current_offer_ids)
+            params = tuple(current_offer_ids)
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM offers_seen
+                WHERE offer_id NOT IN ({placeholders})
+                """,
+                params,
+            ).fetchone()
+            conn.execute(
+                f"""
+                DELETE FROM subscriber_offer_notifications
+                WHERE offer_id NOT IN ({placeholders})
+                """,
+                params,
+            )
+            conn.execute(
+                f"""
+                DELETE FROM offers_seen
+                WHERE offer_id NOT IN ({placeholders})
+                """,
+                params,
+            )
+        else:
+            row = conn.execute("SELECT COUNT(*) FROM offers_seen").fetchone()
+            conn.execute("DELETE FROM subscriber_offer_notifications")
+            conn.execute("DELETE FROM offers_seen")
+    return int(row[0]) if row else 0
+
+
 def get_threshold(default: float) -> float:
     with _connect() as conn:
         row = conn.execute(
@@ -268,14 +342,64 @@ def get_threshold(default: float) -> float:
 
 
 def get_user_threshold(user_id: int, default: float) -> float:
-    subscriber = get_subscriber(user_id)
-    if not subscriber:
-        return default
-    value = subscriber.get("score_threshold")
+    filters = get_user_filters(user_id)
+    value = filters.get("borrower_score_min")
     try:
         return float(value) if value is not None else default
     except (TypeError, ValueError):
         return default
+
+
+def get_user_filters(user_id: int) -> dict[str, Any]:
+    subscriber = get_subscriber(user_id)
+    if not subscriber:
+        return empty_user_filters()
+
+    filters_json = subscriber.get("filters_json")
+    filters = _parse_filters(filters_json)
+    if "borrower_score_min" not in filters and subscriber.get("score_threshold") is not None:
+        filters["borrower_score_min"] = subscriber.get("score_threshold")
+    return filters
+
+
+def set_user_filter(
+    user_id: int,
+    chat_id: int,
+    key: str,
+    value: Any,
+    username: str | None = None,
+    first_name: str | None = None,
+) -> dict[str, Any]:
+    filters = get_user_filters(user_id)
+    if value is None:
+        filters.pop(key, None)
+    else:
+        filters[key] = value
+    _save_user_filters(
+        user_id=user_id,
+        chat_id=chat_id,
+        filters=filters,
+        username=username,
+        first_name=first_name,
+    )
+    return filters
+
+
+def set_user_filters(
+    user_id: int,
+    chat_id: int,
+    filters: dict[str, Any],
+    username: str | None = None,
+    first_name: str | None = None,
+) -> dict[str, Any]:
+    _save_user_filters(
+        user_id=user_id,
+        chat_id=chat_id,
+        filters=dict(filters),
+        username=username,
+        first_name=first_name,
+    )
+    return get_user_filters(user_id)
 
 
 def set_user_threshold(
@@ -285,19 +409,43 @@ def set_user_threshold(
     username: str | None = None,
     first_name: str | None = None,
 ) -> None:
+    set_user_filter(
+        user_id=user_id,
+        chat_id=chat_id,
+        key="borrower_score_min",
+        value=value,
+        username=username,
+        first_name=first_name,
+    )
+
+
+def set_user_search_enabled(user_id: int, enabled: bool) -> None:
     with _connect() as conn:
         conn.execute(
             """
-            INSERT INTO subscribers (user_id, chat_id, username, first_name, score_threshold)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                chat_id = excluded.chat_id,
-                username = excluded.username,
-                first_name = excluded.first_name,
-                score_threshold = excluded.score_threshold
+            UPDATE subscribers
+            SET search_enabled = ?
+            WHERE user_id = ?
             """,
-            (user_id, chat_id, username, first_name, value),
+            (1 if enabled else 0, user_id),
         )
+
+
+def pause_user_search(user_id: int) -> bool:
+    subscriber = get_subscriber(user_id)
+    if not subscriber:
+        return False
+    was_enabled = _search_enabled_value(subscriber)
+    if was_enabled:
+        set_user_search_enabled(user_id, enabled=False)
+    return was_enabled
+
+
+def is_user_search_enabled(user_id: int) -> bool:
+    subscriber = get_subscriber(user_id)
+    if not subscriber:
+        return False
+    return _search_enabled_value(subscriber)
 
 
 def set_threshold(value: float) -> None:
@@ -355,11 +503,132 @@ def get_last_check() -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+def get_private_user_ids() -> list[int]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT user_id
+            FROM subscribers
+            WHERE chat_id = user_id
+            ORDER BY COALESCE(created_at, started_at, expires_at) ASC, user_id ASC
+            """
+        ).fetchall()
+    return [int(row["user_id"]) for row in rows]
+
+
+def get_subscribers_page(limit: int = 10, offset: int = 0) -> tuple[list[dict[str, Any]], int]:
+    safe_limit = max(1, limit)
+    safe_offset = max(0, offset)
+    with _connect() as conn:
+        total_row = conn.execute(
+            """
+            SELECT COUNT(*) AS total_count
+            FROM subscribers
+            WHERE chat_id = user_id
+            """
+        ).fetchone()
+        rows = conn.execute(
+            """
+            SELECT
+                user_id,
+                chat_id,
+                username,
+                first_name,
+                created_at,
+                score_threshold,
+                filters_json,
+                search_enabled,
+                started_at,
+                expires_at,
+                trial_ended_notified_at
+            FROM subscribers
+            WHERE chat_id = user_id
+            ORDER BY COALESCE(created_at, started_at, expires_at) DESC, user_id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (safe_limit, safe_offset),
+        ).fetchall()
+    total_count = int(total_row["total_count"]) if total_row else 0
+    return [dict(row) for row in rows], total_count
+
+
+def get_user_stats() -> dict[str, Any]:
+    now = _utcnow()
+    now_text = now.isoformat(timespec="seconds")
+    day_ago = (now - timedelta(days=1)).isoformat(timespec="seconds")
+    week_ago = (now - timedelta(days=7)).isoformat(timespec="seconds")
+    month_ago = (now - timedelta(days=30)).isoformat(timespec="seconds")
+
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total_users,
+                SUM(CASE WHEN filters_json IS NOT NULL THEN 1 ELSE 0 END) AS configured_users,
+                SUM(CASE WHEN started_at IS NOT NULL THEN 1 ELSE 0 END) AS activated_users,
+                SUM(CASE WHEN COALESCE(created_at, started_at) >= ? THEN 1 ELSE 0 END) AS registrations_day,
+                SUM(CASE WHEN COALESCE(created_at, started_at) >= ? THEN 1 ELSE 0 END) AS registrations_week,
+                SUM(CASE WHEN COALESCE(created_at, started_at) >= ? THEN 1 ELSE 0 END) AS registrations_month,
+                SUM(
+                    CASE
+                        WHEN started_at IS NOT NULL
+                             AND expires_at IS NOT NULL
+                             AND expires_at > ?
+                        THEN 1 ELSE 0
+                    END
+                ) AS active_users,
+                SUM(
+                    CASE
+                        WHEN started_at IS NOT NULL
+                             AND expires_at IS NOT NULL
+                             AND expires_at > ?
+                             AND COALESCE(search_enabled, 1) = 1
+                        THEN 1 ELSE 0
+                    END
+                ) AS running_users,
+                SUM(
+                    CASE
+                        WHEN started_at IS NOT NULL
+                             AND expires_at IS NOT NULL
+                             AND expires_at > ?
+                             AND COALESCE(search_enabled, 1) = 0
+                        THEN 1 ELSE 0
+                    END
+                ) AS paused_users,
+                SUM(
+                    CASE
+                        WHEN started_at IS NOT NULL
+                             AND expires_at IS NOT NULL
+                             AND expires_at <= ?
+                        THEN 1 ELSE 0
+                    END
+                ) AS expired_users,
+                MAX(COALESCE(created_at, started_at)) AS last_registration_at,
+                MAX(started_at) AS last_activation_at
+            FROM subscribers
+            WHERE chat_id = user_id
+            """,
+            (day_ago, week_ago, month_ago, now_text, now_text, now_text, now_text),
+        ).fetchone()
+    return dict(row) if row else {}
+
+
 def is_trial_active(user_id: int) -> bool:
     subscriber = get_subscriber(user_id)
     if not subscriber:
         return False
     return _is_private_subscriber_row(subscriber) and _is_trial_active_row(subscriber)
+
+
+def is_trial_running(user_id: int) -> bool:
+    subscriber = get_subscriber(user_id)
+    if not subscriber:
+        return False
+    return (
+        _is_private_subscriber_row(subscriber)
+        and _is_trial_active_row(subscriber)
+        and _search_enabled_value(subscriber)
+    )
 
 
 def _database_path() -> Path:
@@ -404,23 +673,78 @@ def _is_private_subscriber_row(row: dict[str, Any]) -> bool:
         return False
 
 
+def _search_enabled_value(row: dict[str, Any]) -> bool:
+    value = row.get("search_enabled")
+    if value is None:
+        return True
+    try:
+        return bool(int(value))
+    except (TypeError, ValueError):
+        return bool(value)
+
+
 def _upsert_subscriber_identity(
     user_id: int,
     chat_id: int,
     username: str | None,
     first_name: str | None,
 ) -> None:
+    created_at = _now()
     with _connect() as conn:
         conn.execute(
             """
-            INSERT INTO subscribers (user_id, chat_id, username, first_name)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO subscribers (user_id, chat_id, username, first_name, created_at)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 chat_id = excluded.chat_id,
                 username = excluded.username,
-                first_name = excluded.first_name
+                first_name = excluded.first_name,
+                created_at = COALESCE(subscribers.created_at, excluded.created_at)
             """,
-            (user_id, chat_id, username, first_name),
+            (user_id, chat_id, username, first_name, created_at),
+        )
+
+
+def _save_user_filters(
+    *,
+    user_id: int,
+    chat_id: int,
+    filters: dict[str, Any],
+    username: str | None,
+    first_name: str | None,
+) -> None:
+    threshold = filters.get("borrower_score_min")
+    created_at = _now()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO subscribers (
+                user_id,
+                chat_id,
+                username,
+                first_name,
+                created_at,
+                score_threshold,
+                filters_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                chat_id = excluded.chat_id,
+                username = excluded.username,
+                first_name = excluded.first_name,
+                created_at = COALESCE(subscribers.created_at, excluded.created_at),
+                score_threshold = excluded.score_threshold,
+                filters_json = excluded.filters_json
+            """,
+            (
+                user_id,
+                chat_id,
+                username,
+                first_name,
+                created_at,
+                threshold,
+                json.dumps(filters, ensure_ascii=False, sort_keys=True),
+            ),
         )
 
 
@@ -434,3 +758,15 @@ def _ensure_column(
     if any(column["name"] == column_name for column in columns):
         return
     conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}")
+
+
+def _parse_filters(value: Any) -> dict[str, Any]:
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
