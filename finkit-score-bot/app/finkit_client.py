@@ -40,6 +40,14 @@ KNOWN_OFFERS_API_PATH = "/loans-to-invest/"
 DEFAULT_OFFERS_ORDERING = "-signed_at"
 NAVIGATION_RETRIES = 3
 NAVIGATION_RETRY_DELAY_MS = 3_000
+CONTEXT_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/137.0.0.0 Safari/537.36"
+)
+CONTEXT_LOCALE = "ru-RU"
+CONTEXT_TIMEZONE_ID = "Europe/Minsk"
+CONTEXT_VIEWPORT = {"width": 1440, "height": 900}
 
 
 async def get_offers() -> list[Offer]:
@@ -65,7 +73,12 @@ async def _load_offers_with_browser(*, use_storage_state: bool) -> tuple[list[Of
     settings = get_settings()
     target_url = current_offers_url()
     settings.playwright_state_file.parent.mkdir(parents=True, exist_ok=True)
-    context_options: dict[str, Any] = {}
+    context_options: dict[str, Any] = {
+        "user_agent": CONTEXT_USER_AGENT,
+        "locale": CONTEXT_LOCALE,
+        "timezone_id": CONTEXT_TIMEZONE_ID,
+        "viewport": CONTEXT_VIEWPORT,
+    }
     if use_storage_state and settings.playwright_state_file.exists():
         context_options["storage_state"] = str(settings.playwright_state_file)
 
@@ -82,6 +95,14 @@ async def _load_offers_with_browser(*, use_storage_state: bool) -> tuple[list[Of
             if direct_api_offers:
                 logger.info("offers source=direct-api offers_count=%s", len(direct_api_offers))
                 return direct_api_offers, False
+            if request_state.get("auth_forbidden"):
+                logger.warning("offers api denied access after initial auth, forcing re-login in current browser context")
+                await _force_reauthenticate(page, context)
+                request_state["auth_forbidden"] = False
+                direct_api_offers = await _offers_from_known_api(context, page, request_state)
+                if direct_api_offers:
+                    logger.info("offers source=direct-api offers_count=%s after re-login", len(direct_api_offers))
+                    return direct_api_offers, False
 
             captures = await discover_offers_api(page)
             best_api_offers: list[Offer] = []
@@ -212,6 +233,7 @@ async def _login_if_needed(page: Any, context: Any) -> None:
         page,
         [
             'button[type="submit"]',
+            'button:has-text("Отправить")',
             'button:has-text("Войти")',
             'button:has-text("Продолжить")',
         ],
@@ -221,6 +243,9 @@ async def _login_if_needed(page: Any, context: Any) -> None:
 
     await button.click()
     await _wait_network_idle(page)
+    if not await _wait_for_login_completion(page, context):
+        await _submit_login_form_fallback(page)
+        await _wait_network_idle(page)
     if not await _wait_for_login_completion(page, context):
         await _raise_if_blocked_auth(page)
         raise RuntimeError("Не удалось авторизоваться в FinKit: проверьте логин и пароль")
@@ -269,6 +294,53 @@ async def _dismiss_cookie_banner_if_needed(page: Any) -> None:
     try:
         await button.click()
         await page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+
+async def _submit_login_form_fallback(page: Any) -> None:
+    try:
+        submitted = await page.evaluate(
+            """
+            () => {
+                const form = document.querySelector('form.form');
+                if (!form) return false;
+                if (typeof form.requestSubmit === 'function') {
+                    form.requestSubmit();
+                    return true;
+                }
+                form.submit();
+                return true;
+            }
+            """
+        )
+    except Exception:
+        submitted = False
+    if submitted:
+        await page.wait_for_timeout(1000)
+
+
+async def _force_reauthenticate(page: Any, context: Any) -> None:
+    await _clear_context_auth_state(page, context)
+    await _open_offers_page(page)
+    await _login_if_needed(page, context)
+
+
+async def _clear_context_auth_state(page: Any, context: Any) -> None:
+    try:
+        await context.clear_cookies()
+    except Exception:
+        pass
+    try:
+        await page.goto("about:blank")
+        await page.evaluate(
+            """
+            () => {
+                try { localStorage.clear(); } catch (error) {}
+                try { sessionStorage.clear(); } catch (error) {}
+            }
+            """
+        )
     except Exception:
         pass
 
