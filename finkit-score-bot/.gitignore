@@ -13,3 +13,6 @@ __pycache__/
 .pytest_cache/
 .venv/
 tests/
+!tests/
+tests/*
+!tests/test_offer_filters.py

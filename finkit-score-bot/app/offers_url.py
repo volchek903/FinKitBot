@@ -4,6 +4,9 @@ from typing import Any
 from app.config import get_settings
 from app.user_filters import USER_FILTER_QUERY_KEYS
 
+LEGACY_USER_FILTER_QUERY_KEYS = ("invest_min", "invest_max")
+STRIPPED_USER_FILTER_QUERY_KEYS = USER_FILTER_QUERY_KEYS + LEGACY_USER_FILTER_QUERY_KEYS
+
 
 def build_offers_url(
     base_url: str,
@@ -17,7 +20,7 @@ def build_offers_url(
     replaced = False
 
     for key, value in query:
-        if key in USER_FILTER_QUERY_KEYS:
+        if key in STRIPPED_USER_FILTER_QUERY_KEYS:
             if not replaced:
                 updated_query.extend(filter_query)
                 replaced = True
@@ -46,7 +49,7 @@ def current_offers_url() -> str:
 def strip_user_filter_query(base_url: str) -> str:
     parts = urlsplit(base_url)
     query = parse_qsl(parts.query, keep_blank_values=True)
-    updated_query = [(key, value) for key, value in query if key not in USER_FILTER_QUERY_KEYS]
+    updated_query = [(key, value) for key, value in query if key not in STRIPPED_USER_FILTER_QUERY_KEYS]
     return urlunsplit(
         (
             parts.scheme,

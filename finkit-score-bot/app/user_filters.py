@@ -27,8 +27,6 @@ NUMERIC_LIMITS: dict[str, tuple[float, float]] = {
     "term_max": (0, 365),
     "interest_rate_min": (0, 10),
     "interest_rate_max": (0, 10),
-    "invest_min": (0, 100000),
-    "invest_max": (0, 100000),
 }
 
 FILTER_FIELDS: tuple[UserFilterField, ...] = (
@@ -91,18 +89,6 @@ FILTER_FIELDS: tuple[UserFilterField, ...] = (
         label="Рейтинг до",
         kind="rating",
         prompt="Введите максимальный рейтинг буквой от A до F. Для очистки отправьте `-`.",
-    ),
-    UserFilterField(
-        key="invest_min",
-        label="Инвест от",
-        kind="number",
-        prompt="Введите минимальное уже инвестированное значение числом. Для очистки отправьте `-`.",
-    ),
-    UserFilterField(
-        key="invest_max",
-        label="Инвест до",
-        kind="number",
-        prompt="Введите максимальное уже инвестированное значение числом. Для очистки отправьте `-`.",
     ),
     UserFilterField(
         key="borrower_income_confirmed",
@@ -289,8 +275,6 @@ def offer_matches_user_filters(offer: Offer, filters: dict[str, Any]) -> bool:
                 resolved.get("borrower_rating_min"),
                 resolved.get("borrower_rating_max"),
             ),
-            _matches_min(_offer_number(offer, "invest"), resolved.get("invest_min")),
-            _matches_max(_offer_number(offer, "invest"), resolved.get("invest_max")),
             _matches_bool(
                 _offer_bool(offer, "borrower_income_confirmed"),
                 resolved.get("borrower_income_confirmed"),
@@ -310,7 +294,6 @@ def empty_user_filters() -> dict[str, Any]:
         "amount_min": 0,
         "term_min": 0,
         "interest_rate_min": 0,
-        "invest_min": 0,
     }
 
 
@@ -384,8 +367,6 @@ def _offer_number(offer: Offer, field_name: str) -> float | None:
         return parse_score(raw.get("term", offer.term))
     if field_name == "interest_rate":
         return parse_score(raw.get("interest_rate", offer.rate))
-    if field_name == "invest":
-        return parse_score(raw.get("invest", raw.get("total_invested")))
     return None
 
 

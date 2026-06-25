@@ -23,7 +23,6 @@ FILTER_BUTTON_ROWS: tuple[tuple[str, ...], ...] = (
     ("term_min", "term_max"),
     ("interest_rate_min", "interest_rate_max"),
     ("borrower_rating_min", "borrower_rating_max"),
-    ("invest_min", "invest_max"),
     ("borrower_income_confirmed", "borrower_enforcement_up_to_1_month_absent"),
     ("borrower_age_group",),
 )
@@ -1160,7 +1159,6 @@ def _compact_filters_text(filters: dict[str, Any]) -> str:
             f"срок {_format_filter_range(filters, 'term_min', 'term_max')}",
             f"ставка {_format_filter_range(filters, 'interest_rate_min', 'interest_rate_max')}",
             f"рейтинг {_format_filter_range(filters, 'borrower_rating_min', 'borrower_rating_max')}",
-            f"инвест {_format_filter_range(filters, 'invest_min', 'invest_max')}",
             f"доход {_format_filter_brief(filters, 'borrower_income_confirmed')}",
             (
                 "исп.пр-ва "
@@ -1454,7 +1452,7 @@ def _build_settings_text(
         f"📆 Срок: {_format_filter_range(filters, 'term_min', 'term_max')}\n"
         f"📈 Ставка: {_format_filter_range(filters, 'interest_rate_min', 'interest_rate_max')}\n"
         f"🏷️ Рейтинг: {_format_filter_range(filters, 'borrower_rating_min', 'borrower_rating_max')}\n"
-        f"💼 Инвест: {_format_filter_range(filters, 'invest_min', 'invest_max')}\n\n"
+        "\n"
         "👤 Профиль заемщика\n"
         f"💳 Доход подтвержден: {_format_filter_brief(filters, 'borrower_income_confirmed')}\n"
         f"📄 Исп. пр-ва: {_format_filter_brief(filters, 'borrower_enforcement_up_to_1_month_absent')}\n"
@@ -1480,7 +1478,6 @@ def _build_active_trial_text(
         f"📆 Срок: {_format_filter_range(filters, 'term_min', 'term_max')}\n"
         f"📈 Ставка: {_format_filter_range(filters, 'interest_rate_min', 'interest_rate_max')}\n"
         f"🏷️ Рейтинг: {_format_filter_range(filters, 'borrower_rating_min', 'borrower_rating_max')}\n"
-        f"💼 Инвест: {_format_filter_range(filters, 'invest_min', 'invest_max')}\n"
         f"💳 Доход подтвержден: {_format_filter_brief(filters, 'borrower_income_confirmed')}\n"
         f"📄 Исп. пр-ва: {_format_filter_brief(filters, 'borrower_enforcement_up_to_1_month_absent')}\n"
         f"🪪 Возраст: {_format_filter_brief(filters, 'borrower_age_group')}\n\n"
