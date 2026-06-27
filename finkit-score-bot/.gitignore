@@ -15,4 +15,4 @@ __pycache__/
 tests/
 !tests/
 tests/*
-!tests/test_offer_filters.py
+!tests/test_*.py

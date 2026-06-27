@@ -31,6 +31,8 @@ ADMIN_USERS_PAGE_SIZE = 10
 ADMIN_NOOP_CALLBACK = f"{ADMIN_CALLBACK_PREFIX}noop"
 COMMAND_SYNC_RETRIES = 3
 COMMAND_SYNC_RETRY_DELAY_SECONDS = 2
+MIN_TRIAL_DURATION_DAYS = 1
+MAX_TRIAL_DURATION_DAYS = 365
 
 logger = logging.getLogger(__name__)
 _USER_BACKGROUND_TASKS: dict[int, set[asyncio.Task[Any]]] = {}
@@ -64,6 +66,7 @@ def create_dispatcher() -> Any:
         waiting_broadcast_all_message = State()
         waiting_broadcast_target_id = State()
         waiting_broadcast_target_message = State()
+        waiting_trial_duration_days = State()
 
     router = Router()
 
@@ -78,11 +81,15 @@ def create_dispatcher() -> Any:
         _cancel_user_background_tasks(user_id)
         search_was_running = await storage.apause_user_search(user_id)
         settings = get_settings()
-        filters = await _resolved_filters(user_id, settings)
+        filters, trial_duration_text = await asyncio.gather(
+            _resolved_filters(user_id, settings),
+            _trial_duration_text(settings),
+        )
         await message.answer(
             _build_welcome_text(
                 settings=settings,
                 filters=filters,
+                trial_duration_text=trial_duration_text,
                 search_was_stopped=search_was_running,
             ),
             reply_markup=_build_settings_keyboard(
@@ -236,6 +243,21 @@ def create_dispatcher() -> Any:
             await callback.answer()
             return
 
+        if data == f"{ADMIN_CALLBACK_PREFIX}trial_duration":
+            await state.clear()
+            await state.set_state(AdminInputState.waiting_trial_duration_days)
+            current_days = await storage.aget_trial_duration_days(get_settings().trial_duration_hours)
+            await _edit_message_text(
+                message,
+                text=_build_admin_trial_duration_prompt(current_days),
+                reply_markup=_build_admin_cancel_keyboard(
+                    InlineKeyboardMarkup,
+                    InlineKeyboardButton,
+                ),
+            )
+            await callback.answer()
+            return
+
         await callback.answer()
 
     @router.message(AdminInputState.waiting_broadcast_target_id)
@@ -348,6 +370,62 @@ def create_dispatcher() -> Any:
                 target_user_id=target_user_id,
                 sent_count=sent_count,
                 failed_ids=failed_ids,
+            ),
+            reply_markup=_build_admin_keyboard(InlineKeyboardMarkup, InlineKeyboardButton),
+        )
+
+    @router.message(AdminInputState.waiting_trial_duration_days)
+    async def admin_trial_duration_days(message: Message, state: FSMContext) -> None:
+        if await _handle_admin_escape_command(
+            message,
+            state,
+            InlineKeyboardMarkup,
+            InlineKeyboardButton,
+        ):
+            return
+        if not _is_admin_message(message):
+            await state.clear()
+            return
+        if not _is_private_chat(message):
+            await message.answer("🔒 Админка доступна только в личных сообщениях.")
+            return
+
+        raw_value = (message.text or "").strip()
+        try:
+            days = int(raw_value)
+        except ValueError:
+            await message.answer(
+                (
+                    "⚠️ Нужны целые дни. Пример: `5`.\n"
+                    f"Допустимый диапазон: {MIN_TRIAL_DURATION_DAYS}-{MAX_TRIAL_DURATION_DAYS}."
+                ),
+                reply_markup=_build_admin_cancel_keyboard(
+                    InlineKeyboardMarkup,
+                    InlineKeyboardButton,
+                ),
+            )
+            return
+
+        if days < MIN_TRIAL_DURATION_DAYS or days > MAX_TRIAL_DURATION_DAYS:
+            await message.answer(
+                (
+                    f"⚠️ Значение должно быть в диапазоне "
+                    f"{MIN_TRIAL_DURATION_DAYS}-{MAX_TRIAL_DURATION_DAYS} дней."
+                ),
+                reply_markup=_build_admin_cancel_keyboard(
+                    InlineKeyboardMarkup,
+                    InlineKeyboardButton,
+                ),
+            )
+            return
+
+        updated_users = await storage.aset_trial_duration_days(days)
+        await state.clear()
+        await message.answer(
+            (
+                f"✅ Тестовый период изменен: {_format_trial_duration_days(days)}.\n"
+                f"♻️ Пересчитано пользователей: {updated_users}.\n"
+                "Новые и уже активированные пользователи теперь получают срок от даты своей активации."
             ),
             reply_markup=_build_admin_keyboard(InlineKeyboardMarkup, InlineKeyboardButton),
         )
@@ -476,12 +554,13 @@ def create_dispatcher() -> Any:
 
         await state.clear()
         settings = get_settings()
+        trial_duration_hours = await _trial_duration_hours(settings)
         activation = await storage.aactivate_trial(
             user_id=user.id,
             chat_id=user.id,
             username=user.username,
             first_name=user.first_name,
-            duration_hours=settings.trial_duration_hours,
+            duration_hours=trial_duration_hours,
         )
         filters = await _resolved_filters(user.id, settings)
         just_started = activation["state"] == "started"
@@ -635,10 +714,14 @@ def create_dispatcher() -> Any:
         last_check_time = _format_datetime(last_check["checked_at"] if last_check else None)
 
         if admin_access:
-            default_threshold = await _default_threshold(settings)
+            default_threshold, trial_duration_text = await asyncio.gather(
+                _default_threshold(settings),
+                _trial_duration_text(settings),
+            )
             await message.answer(
                 "🛠 Бот работает\n"
                 f"🎯 Порог по умолчанию: {_format_number(default_threshold)}\n"
+                f"🎁 Тестовый период: {trial_duration_text}\n"
                 f"⏱ Интервал проверки: {settings.check_interval_seconds} сек.\n"
                 f"🕒 Последняя проверка: {last_check_time}"
             )
@@ -782,6 +865,7 @@ def create_dispatcher() -> Any:
             return
 
         settings = get_settings()
+        trial_duration_text = await _trial_duration_text(settings)
         lines = [
             "📚 Команды:",
             "/start - главное меню и остановка поиска",
@@ -801,7 +885,7 @@ def create_dispatcher() -> Any:
             )
         else:
             lines.append(
-                f"🎁 После активации бесплатный доступ работает {settings.trial_duration_hours} часа(ов)."
+                f"🎁 После активации бесплатный доступ работает {trial_duration_text}."
             )
         await message.answer("\n".join(lines))
 
@@ -903,6 +987,12 @@ def _build_admin_keyboard(markup_cls: Any, button_cls: Any) -> Any:
             [
                 button_cls(text="Статистика", callback_data=f"{ADMIN_CALLBACK_PREFIX}stats"),
                 button_cls(text="Пользователи", callback_data=f"{ADMIN_CALLBACK_PREFIX}users"),
+            ],
+            [
+                button_cls(
+                    text="Тестовый период",
+                    callback_data=f"{ADMIN_CALLBACK_PREFIX}trial_duration",
+                )
             ],
             [
                 button_cls(
@@ -1013,9 +1103,11 @@ def _build_admin_users_keyboard(
 
 
 async def _build_admin_home_text() -> str:
-    stats, last_check = await asyncio.gather(
+    settings = get_settings()
+    stats, last_check, trial_duration_text = await asyncio.gather(
         storage.aget_user_stats(),
         storage.aget_last_check(),
+        _trial_duration_text(settings),
     )
     last_check_time = last_check["checked_at"] if last_check else None
     return (
@@ -1024,6 +1116,7 @@ async def _build_admin_home_text() -> str:
         f"🟢 Поиск активен: {_safe_int(stats.get('running_users'))}\n"
         f"⏸️ На паузе: {_safe_int(stats.get('paused_users'))}\n"
         f"⌛ Период завершен: {_safe_int(stats.get('expired_users'))}\n"
+        f"🎁 Тестовый период: {trial_duration_text}\n"
         f"🕒 Последняя проверка: {_format_datetime(last_check_time)}\n\n"
         "Выберите действие ниже."
     )
@@ -1098,6 +1191,16 @@ def _build_admin_broadcast_all_prompt(recipients_count: int) -> str:
         "📢 Рассылка всем пользователям\n\n"
         f"👥 Получателей в базе: {recipients_count}\n\n"
         "Отправьте одним сообщением текст, фото, видео или другой контент для рассылки."
+    )
+
+
+def _build_admin_trial_duration_prompt(current_days: int) -> str:
+    return (
+        "🎁 Настройка тестового периода\n\n"
+        f"Текущее значение: {_format_trial_duration_days(current_days)}.\n\n"
+        "Введите количество дней целым числом.\n"
+        "Пример: `5`.\n\n"
+        "После сохранения бот пересчитает срок доступа для уже активированных пользователей от даты их запуска."
     )
 
 
@@ -1399,6 +1502,7 @@ def _build_settings_keyboard(markup_cls: Any, button_cls: Any, *, filters: dict[
 def _build_welcome_text(
     settings: Settings,
     filters: dict[str, Any],
+    trial_duration_text: str,
     *,
     search_was_stopped: bool,
 ) -> str:
@@ -1406,7 +1510,7 @@ def _build_welcome_text(
     text = (
         "👋 FinKit Score Bot помогает находить новые заявки FinKit и присылает их в ЛС.\n\n"
         f"🎯 Стартовый фильтр: скор {_comparator(settings)} {_format_number(threshold)}.\n"
-        f"🎁 Бесплатный доступ: {settings.trial_duration_hours} часа(ов).\n\n"
+        f"🎁 Бесплатный доступ: {trial_duration_text}.\n\n"
         "⚙️ Выберите нужные параметры ниже и запустите поиск."
     )
     if search_was_stopped:
@@ -1627,6 +1731,25 @@ def _comparator(settings: Settings) -> str:
 
 async def _default_threshold(settings: Settings) -> float:
     return await storage.aget_threshold(settings.default_score_threshold)
+
+
+async def _trial_duration_hours(settings: Settings) -> int:
+    return await storage.aget_trial_duration_hours(settings.trial_duration_hours)
+
+
+async def _trial_duration_text(settings: Settings) -> str:
+    return _format_trial_duration_hours(await _trial_duration_hours(settings))
+
+
+def _format_trial_duration_days(days: int) -> str:
+    return f"{int(days)} дн."
+
+
+def _format_trial_duration_hours(hours: int) -> str:
+    safe_hours = max(1, int(hours))
+    if safe_hours % 24 == 0:
+        return _format_trial_duration_days(safe_hours // 24)
+    return f"{safe_hours} час(ов)"
 
 
 async def _resolved_filters(user_id: int, settings: Settings) -> dict[str, Any]:

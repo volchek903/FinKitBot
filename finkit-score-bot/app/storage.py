@@ -2,6 +2,7 @@ import asyncio
 import sqlite3
 from datetime import datetime, timedelta, timezone
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,8 @@ from app.user_filters import empty_user_filters
 
 SQLITE_CONNECT_TIMEOUT_SECONDS = 30
 SQLITE_BUSY_TIMEOUT_MS = 30_000
+SCORE_THRESHOLD_SETTING_KEY = "score_threshold"
+TRIAL_DURATION_DAYS_SETTING_KEY = "trial_duration_days"
 
 
 def init_db() -> None:
@@ -338,7 +341,7 @@ def get_threshold(default: float) -> float:
     with _connect() as conn:
         row = conn.execute(
             "SELECT value FROM settings WHERE key = ?",
-            ("score_threshold",),
+            (SCORE_THRESHOLD_SETTING_KEY,),
         ).fetchone()
     if row is None:
         return default
@@ -463,8 +466,71 @@ def set_threshold(value: float) -> None:
             VALUES (?, ?)
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
             """,
-            ("score_threshold", str(value)),
+            (SCORE_THRESHOLD_SETTING_KEY, str(value)),
         )
+
+
+def get_trial_duration_days(default_hours: int) -> int:
+    stored_days = _get_trial_duration_setting_days()
+    if stored_days is not None:
+        return stored_days
+    return max(1, math.ceil(max(1, int(default_hours)) / 24))
+
+
+def get_trial_duration_hours(default_hours: int) -> int:
+    stored_days = _get_trial_duration_setting_days()
+    if stored_days is None:
+        return max(1, int(default_hours))
+    return stored_days * 24
+
+
+def set_trial_duration_days(days: int) -> int:
+    safe_days = max(1, int(days))
+    now = _utcnow()
+    updated_count = 0
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO settings (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (TRIAL_DURATION_DAYS_SETTING_KEY, str(safe_days)),
+        )
+
+        rows = conn.execute(
+            """
+            SELECT user_id, started_at, trial_ended_notified_at
+            FROM subscribers
+            WHERE started_at IS NOT NULL
+            """
+        ).fetchall()
+
+        for row in rows:
+            started_at = _parse_datetime(row["started_at"])
+            if started_at is None:
+                continue
+
+            expires_dt = started_at + timedelta(days=safe_days)
+            trial_ended_notified_at = row["trial_ended_notified_at"]
+            if expires_dt > now:
+                trial_ended_notified_at = None
+
+            conn.execute(
+                """
+                UPDATE subscribers
+                SET expires_at = ?, trial_ended_notified_at = ?
+                WHERE user_id = ?
+                """,
+                (
+                    expires_dt.isoformat(timespec="seconds"),
+                    trial_ended_notified_at,
+                    row["user_id"],
+                ),
+            )
+            updated_count += 1
+
+    return updated_count
 
 
 def save_check_log(
@@ -784,6 +850,21 @@ def _parse_filters(value: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _get_trial_duration_setting_days() -> int | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?",
+            (TRIAL_DURATION_DAYS_SETTING_KEY,),
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        value = int(str(row["value"]).strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 async def ainit_db() -> None:
     await asyncio.to_thread(init_db)
 
@@ -827,6 +908,14 @@ async def aforget_missing_offers(current_offer_ids: set[str]) -> int:
 
 async def aget_threshold(default: float) -> float:
     return await asyncio.to_thread(get_threshold, default)
+
+
+async def aget_trial_duration_days(default_hours: int) -> int:
+    return await asyncio.to_thread(get_trial_duration_days, default_hours)
+
+
+async def aget_trial_duration_hours(default_hours: int) -> int:
+    return await asyncio.to_thread(get_trial_duration_hours, default_hours)
 
 
 async def aget_user_filters(user_id: int) -> dict[str, Any]:
@@ -883,6 +972,10 @@ async def ais_trial_running(user_id: int) -> bool:
 
 async def aset_threshold(value: float) -> None:
     await asyncio.to_thread(set_threshold, value)
+
+
+async def aset_trial_duration_days(days: int) -> int:
+    return await asyncio.to_thread(set_trial_duration_days, days)
 
 
 async def asave_check_log(
